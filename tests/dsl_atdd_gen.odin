@@ -55,13 +55,14 @@ scenario_scope_end :: proc(h: Scenario_Handle) {
 }
 
 Suite_Ctx_VTable :: struct {
-	given_recorder_configured: proc(s: ^Suite_Ctx, batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, loc := #caller_location),
+	given_recorder_configured: proc(s: ^Suite_Ctx, batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location),
 	given_zero_config_recorder_initialized: proc(s: ^Suite_Ctx, loc := #caller_location),
 	given_recorder_enabled_state: proc(s: ^Suite_Ctx, enabled: bool),
 	given_registered_as_default_recorder: proc(s: ^Suite_Ctx, loc := #caller_location),
 	upon_simulating_http_requests_with_nil_recorder: proc(s: ^Suite_Ctx, count: int, payload_bytes: int),
 	upon_simulating_http_requests: proc(s: ^Suite_Ctx, count: int, payload_step_bytes: int),
 	upon_running_concurrent_http_producers: proc(s: ^Suite_Ctx, thread_count: int, iterations_per_thread: int),
+	upon_running_sleipnir_actor_producers: proc(s: ^Suite_Ctx, actor_count: int, messages_per_actor: int, loc := #caller_location),
 	upon_emitting_saturation_burst: proc(s: ^Suite_Ctx, total_events: int),
 	upon_emitting_dynamic_string_telemetry: proc(s: ^Suite_Ctx, count: int, use_default_recorder: bool = true),
 	upon_emitting_dynamic_scoped_spans: proc(s: ^Suite_Ctx, count: int, pause_worker: bool = false),
@@ -94,6 +95,7 @@ _suite_ctx_vtable := Suite_Ctx_VTable{
 	upon_simulating_http_requests_with_nil_recorder = upon_simulating_http_requests_with_nil_recorder,
 	upon_simulating_http_requests = upon_simulating_http_requests,
 	upon_running_concurrent_http_producers = upon_running_concurrent_http_producers,
+	upon_running_sleipnir_actor_producers = upon_running_sleipnir_actor_producers,
 	upon_emitting_saturation_burst = upon_emitting_saturation_burst,
 	upon_emitting_dynamic_string_telemetry = upon_emitting_dynamic_string_telemetry,
 	upon_emitting_dynamic_scoped_spans = upon_emitting_dynamic_scoped_spans,
@@ -117,7 +119,7 @@ _suite_ctx_vtable := Suite_Ctx_VTable{
 }
 
 Given_DSL :: struct {
-	recorder_configured: proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, loc := #caller_location),
+	recorder_configured: proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location),
 	zero_config_recorder_initialized: proc(loc := #caller_location),
 	recorder_enabled_state: proc(enabled: bool),
 	registered_as_default_recorder: proc(loc := #caller_location),
@@ -135,6 +137,7 @@ Upon_DSL :: struct {
 	simulating_http_requests_with_nil_recorder: proc(count: int, payload_bytes: int),
 	simulating_http_requests: proc(count: int, payload_step_bytes: int),
 	running_concurrent_http_producers: proc(thread_count: int, iterations_per_thread: int),
+	running_sleipnir_actor_producers: proc(actor_count: int, messages_per_actor: int, loc := #caller_location),
 	emitting_saturation_burst: proc(total_events: int),
 	emitting_dynamic_string_telemetry: proc(count: int, use_default_recorder: bool = true),
 	emitting_dynamic_scoped_spans: proc(count: int, pause_worker: bool = false),
@@ -151,6 +154,7 @@ upon := Upon_DSL{
 	simulating_http_requests_with_nil_recorder = upon_simulating_http_requests_with_nil_recorder_ambient,
 	simulating_http_requests = upon_simulating_http_requests_ambient,
 	running_concurrent_http_producers = upon_running_concurrent_http_producers_ambient,
+	running_sleipnir_actor_producers = upon_running_sleipnir_actor_producers_ambient,
 	emitting_saturation_burst = upon_emitting_saturation_burst_ambient,
 	emitting_dynamic_string_telemetry = upon_emitting_dynamic_string_telemetry_ambient,
 	emitting_dynamic_scoped_spans = upon_emitting_dynamic_scoped_spans_ambient,
@@ -195,8 +199,8 @@ then := Then_DSL{
 // Ambient Step Wrappers & Procedure Overload Groups (for `*_ctx` steps)
 // =============================================================================
 
-given_recorder_configured_ambient :: #force_inline proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, loc := #caller_location) {
-	given_recorder_configured(current_scenario(loc), batches_per_file, ring_pages, string_copy, policy, loc)
+given_recorder_configured_ambient :: #force_inline proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location) {
+	given_recorder_configured(current_scenario(loc), batches_per_file, ring_pages, string_copy, policy, backend, shared_scheduler_workers, loc)
 }
 
 given_zero_config_recorder_initialized_ambient :: #force_inline proc(loc := #caller_location) {
@@ -221,6 +225,10 @@ upon_simulating_http_requests_ambient :: #force_inline proc(count: int, payload_
 
 upon_running_concurrent_http_producers_ambient :: #force_inline proc(thread_count: int, iterations_per_thread: int) {
 	upon_running_concurrent_http_producers(current_scenario(), thread_count, iterations_per_thread)
+}
+
+upon_running_sleipnir_actor_producers_ambient :: #force_inline proc(actor_count: int, messages_per_actor: int, loc := #caller_location) {
+	upon_running_sleipnir_actor_producers(current_scenario(loc), actor_count, messages_per_actor, loc)
 }
 
 upon_emitting_saturation_burst_ambient :: #force_inline proc(total_events: int) {

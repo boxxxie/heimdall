@@ -6,8 +6,8 @@
 
 ## Architecture Overview
 
-1. **Decoupled Ingestion (`#soa` Ring) & Serialization (`OdinArrow` Worker):**
-   Producers write directly into pre-allocated `#soa[BATCH_CAP]Record` pages (`BATCH_CAP :: 4096`). The background flush thread exclusively owns `oa.Buffer_Pool`, `oa.Primitive_Builder` / `oa.String_Builder`, and disk I/O with zero allocator lock contention.
+1. **Decoupled Ingestion (`#soa` Ring) & Configurable Background Backend (`Dedicated_Thread` or `Sleipnir_Actor`):**
+   Producers write directly into pre-allocated `#soa[BATCH_CAP]Record` pages (`BATCH_CAP :: 4096`) and copy entire `#soa` columns into Arrow buffers via `mem.copy_non_overlapping`. The background serializer can run either on a dedicated OS thread (`backend = .Dedicated_Thread`, default) or as a [**Sleipnir**](deps/sleipnir) actor (`backend = .Sleipnir_Actor`, optionally sharing your application's `actor.Scheduler` via `Config.scheduler`).
 2. **Canonical 11-Column OpenTelemetry-Style Schema:**
    Represents **Spans, Counters, Gauges, Histograms, and Events** from any library in a uniform columnar layout (`timestamp_ns`, `duration_ns`, `span_id`, `parent_id`, `thread_id`, `kind`, `status`, `scope`, `name`, `value_f64`, `attr_i64`), automatically wiring parent-child call trees across libraries via `@(thread_local) tls_active_span_id`.
 3. **Zero-Cost Ergonomics ("Zero Is Initialization" + `@(deferred_out)`):**
@@ -48,12 +48,16 @@ execute_query :: proc(rec: ^heimdall.Recorder, query_id: i64) {
 # Regenerate `tests/dsl_atdd_gen.odin` from `tests/dsl_heimdall.odin` via `core:odin/parser`
 odin run tools/heimdall_gen -vet -strict-style -vet-tabs -disallow-do -- tests
 
-# Type-check library & codegen packages
+# Type-check library, codegen & benchmark packages
 odin check heimdall -no-entry-point -vet -strict-style -vet-tabs -vet-packages:heimdall
 odin check heimdall/codegen -no-entry-point -vet -strict-style -vet-tabs -disallow-do
+odin check benchmarks -vet -strict-style -vet-tabs -vet-packages:heimdall_benchmarks,heimdall
 
 # Run 4-layer ATDD executable specifications (with Tracking_Allocator & AST purity verification)
 odin test tests -vet -strict-style -vet-tabs -vet-packages:heimdall,heimdall_codegen,heimdall_tests
+
+# Run throughput & latency benchmark suite
+odin run benchmarks -o:speed -no-bounds-check
 ```
 
 ---

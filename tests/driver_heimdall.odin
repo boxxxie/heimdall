@@ -12,6 +12,7 @@ import "core:time"
 import "../heimdall"
 import codegen "../heimdall/codegen"
 import oa "../deps/OdinArrow/src"
+import actor "../deps/sleipnir/actor"
 
 // =============================================================================
 // Layer 3: Protocol Driver (`tests/driver_heimdall.odin`)
@@ -32,6 +33,8 @@ Suite_Ctx :: struct {
 	t:                    ^testing.T,
 	rec:                  heimdall.Recorder,
 	rec_active:           bool,
+	shared_sched:         actor.Scheduler,
+	shared_sched_active:  bool,
 	last_flushed_batches: u64,
 	last_dropped_records: u64,
 	file_prefix:          string,
@@ -53,6 +56,10 @@ driver_destroy :: proc(s: ^Suite_Ctx) {
 	}
 	if s.rec_active {
 		driver_shutdown_recorder(s)
+	}
+	if s.shared_sched_active {
+		actor.scheduler_stop_and_destroy(&s.shared_sched)
+		s.shared_sched_active = false
 	}
 	for i in 0 ..< MAX_LOADED_SEGMENTS {
 		if s.segments[i].loaded {
@@ -76,18 +83,33 @@ driver_destroy :: proc(s: ^Suite_Ctx) {
 }
 
 driver_configure_recorder :: proc(
-	s:                ^Suite_Ctx,
-	batches_per_file: int,
-	ring_pages:       int,
-	string_copy:      bool,
-	policy:           heimdall.Backpressure_Policy,
+	s:                        ^Suite_Ctx,
+	batches_per_file:         int,
+	ring_pages:               int,
+	string_copy:              bool,
+	policy:                   heimdall.Backpressure_Policy,
+	backend:                  heimdall.Backend_Mode = .Dedicated_Thread,
+	shared_scheduler_workers: int = 0,
 ) -> bool {
+	var_sched: ^actor.Scheduler = nil
+	if shared_scheduler_workers > 0 {
+		if !s.shared_sched_active {
+			if actor.scheduler_init_workers(&s.shared_sched, shared_scheduler_workers, true) != .None {
+				return false
+			}
+			actor.scheduler_start(&s.shared_sched)
+			s.shared_sched_active = true
+		}
+		var_sched = &s.shared_sched
+	}
 	err := heimdall.recorder_init(&s.rec, heimdall.Config{
 		file_prefix          = s.file_prefix,
 		batches_per_file     = batches_per_file,
 		ring_page_count      = ring_pages,
 		string_Fallback_copy = string_copy,
 		policy               = policy,
+		backend              = backend,
+		scheduler            = var_sched,
 	})
 	if err != nil {
 		return false
@@ -184,6 +206,63 @@ driver_run_concurrent_producers :: proc(
 			thread.destroy(t_handle)
 		}
 	}
+}
+
+@(private)
+Actor_Producer_State :: struct {
+	rec:       ^heimdall.Recorder,
+	actor_idx: int,
+}
+
+@(private)
+Actor_Producer_Msg :: struct {
+	seq: int,
+}
+
+@(private)
+actor_producer_receive :: proc(
+	ctx:   ^actor.Context,
+	state: ^Actor_Producer_State,
+	msg:   ^Actor_Producer_Msg,
+) {
+	driver_simulate_http_request(state.rec, state.actor_idx * 1000 + msg.seq)
+	actor.complete_token(ctx, 1)
+}
+
+driver_run_sleipnir_actor_producers :: proc(
+	s:                  ^Suite_Ctx,
+	actor_count:        int,
+	messages_per_actor: int,
+) -> bool {
+	if !s.shared_sched_active || actor_count <= 0 || messages_per_actor <= 0 {
+		return false
+	}
+	actors := make([]^actor.Actor(Actor_Producer_State, Actor_Producer_Msg), actor_count, context.temp_allocator)
+	for i in 0 ..< actor_count {
+		a, err := actor.spawn(
+			&s.shared_sched,
+			Actor_Producer_State{rec = &s.rec, actor_idx = i + 1},
+			actor_producer_receive,
+			u32(i + 1),
+		)
+		if err != .None || a == nil {
+			return false
+		}
+		actors[i] = a
+	}
+
+	total_msgs := i64(actor_count * messages_per_actor)
+	intrinsics.atomic_store_explicit(&s.shared_sched.pending_tokens, total_msgs, .Release)
+
+	for m in 0 ..< messages_per_actor {
+		for i in 0 ..< actor_count {
+			actor.send(actors[i], Actor_Producer_Msg{seq = m})
+		}
+	}
+
+	actor.scheduler_wait_tokens(&s.shared_sched)
+	actor.scheduler_wait_idle(&s.shared_sched)
+	return true
 }
 
 driver_emit_saturation_burst :: proc(s: ^Suite_Ctx, total_events: int) {

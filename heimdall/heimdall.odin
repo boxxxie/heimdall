@@ -1,13 +1,60 @@
 package heimdall
 
 import "base:intrinsics"
+@(require) import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:thread"
-import "core:time"
+@(require) import "core:time"
 import oa "../deps/OdinArrow/src"
+import "../deps/sleipnir/actor"
+
+when ODIN_OS == .Linux {
+	foreign import libc "system:c"
+
+	@(private)
+	CLOCK_REALTIME  :: c.int(0)
+	@(private)
+	CLOCK_MONOTONIC :: c.int(1)
+
+	@(private)
+	Posix_Timespec :: struct {
+		tv_sec:  i64,
+		tv_nsec: i64,
+	}
+
+	@(default_calling_convention = "c")
+	foreign libc {
+		clock_gettime :: proc(clk_id: c.int, tp: ^Posix_Timespec) -> c.int ---
+	}
+
+	// Userspace vDSO monotonic clock read (~12-15 ns vs ~500 ns raw kernel syscall in `core:time`).
+	@(private)
+	monotonic_now_ns :: #force_inline proc "contextless" () -> i64 {
+		ts: Posix_Timespec
+		clock_gettime(CLOCK_MONOTONIC, &ts)
+		return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+	}
+
+	@(private)
+	realtime_now_ns :: #force_inline proc "contextless" () -> i64 {
+		ts: Posix_Timespec
+		clock_gettime(CLOCK_REALTIME, &ts)
+		return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+	}
+} else {
+	@(private)
+	monotonic_now_ns :: #force_inline proc "contextless" () -> i64 {
+		return time.tick_now()._nsec
+	}
+
+	@(private)
+	realtime_now_ns :: #force_inline proc "contextless" () -> i64 {
+		return time.now()._nsec
+	}
+}
 
 BATCH_CAP            :: 4096
 DEFAULT_RING_PAGES   :: 4  // 2+ pages allow lock-free I/O overlap
@@ -31,12 +78,19 @@ Backpressure_Policy :: enum u8 {
 	Block = 1, // Wait for background worker if all ring pages are full
 }
 
+Backend_Mode :: enum u8 {
+	Dedicated_Thread = 0, // Default: dedicated background OS thread owns OdinArrow + disk I/O
+	Sleipnir_Actor   = 1, // Runs the OdinArrow serializer as a Sleipnir Actor on an `actor.Scheduler`
+}
+
 Config :: struct {
-	file_prefix:          string, // e.g., "logs/app_telemetry"
-	batches_per_file:     int,    // Default: 16 (65,536 rows per .arrow file)
-	ring_page_count:      int,    // Default: 4 pages in the producer/consumer ring
-	string_Fallback_copy: bool,   // Set true if passing dynamically freed strings
+	file_prefix:          string,              // e.g., "logs/app_telemetry"
+	batches_per_file:     int,                 // Default: 16 (65,536 rows per .arrow file)
+	ring_page_count:      int,                 // Default: 4 pages in the producer/consumer ring
+	string_Fallback_copy: bool,                // Set true if passing dynamically freed strings
 	policy:               Backpressure_Policy,
+	backend:              Backend_Mode,        // Default: .Dedicated_Thread (or .Sleipnir_Actor if `scheduler != nil`)
+	scheduler:            ^actor.Scheduler,    // Optional shared Sleipnir Scheduler (auto-creates 1-worker scheduler if nil in `.Sleipnir_Actor` mode)
 }
 
 // Canonical telemetry row stored in #soa layout inside each staging page.
@@ -60,10 +114,34 @@ Staging_Page :: struct {
 	count: int,
 }
 
+@(private)
+Flusher_Msg_Kind :: enum u8 {
+	Drain_Ready = 0,
+	Flush_Sync  = 1,
+	Shutdown    = 2,
+}
+
+@(private)
+Flusher_Msg :: struct {
+	kind: Flusher_Msg_Kind,
+}
+
+@(private)
+Flusher_Engine :: struct {
+	mu:              sync.Mutex,
+	r:               ^Recorder,
+	pool:            oa.Buffer_Pool,
+	schema:          oa.Schema,
+	segment_batches: [dynamic]oa.Record_Batch,
+	file_seq:        u64,
+	initialized:     bool,
+}
+
 Recorder :: struct {
 	allocator:       mem.Allocator,
 	cfg:             Config,
 	enabled:         bool,
+	epoch_offset_ns: i64, // Calibrated `realtime_now_ns() - monotonic_now_ns()` offset
 
 	// Producer-Consumer Ring of #soa pages
 	mu:              sync.Mutex,
@@ -83,8 +161,11 @@ Recorder :: struct {
 	dropped_records: u64,
 	flushed_batches: u64,
 
-	// Background worker state (single-threaded ownership of OdinArrow + Buffer_Pool)
+	// Background execution backend (Dedicated OS Thread OR Sleipnir Actor)
 	worker:          ^thread.Thread,
+	sched:           ^actor.Scheduler,
+	owned_sched:     bool,
+	flusher_actor:   ^actor.Actor(Flusher_Engine, Flusher_Msg),
 }
 
 // Thread-local active span state so nested calls across libraries automatically
@@ -149,6 +230,10 @@ recorder_init :: proc(
 		r.cfg.ring_page_count = DEFAULT_RING_PAGES
 	}
 
+	if r.cfg.scheduler != nil {
+		r.cfg.backend = .Sleipnir_Actor
+	}
+
 	r.pages = make([]Staging_Page, r.cfg.ring_page_count, allocator) or_return
 	defer if err != nil {
 		for i in 0 ..< len(r.pages) {
@@ -159,6 +244,14 @@ recorder_init :: proc(
 		delete(r.pages, allocator)
 		delete(r.free_stack)
 		delete(r.ready_queue)
+		if r.flusher_actor != nil {
+			flusher_engine_destroy(&r.flusher_actor.state)
+			actor.destroy(r.flusher_actor)
+		}
+		if r.owned_sched && r.sched != nil {
+			actor.scheduler_stop_and_destroy(r.sched)
+			free(r.sched, allocator)
+		}
 		r^ = {}
 	}
 
@@ -175,9 +268,53 @@ recorder_init :: proc(
 		append(&r.free_stack, i)
 	}
 
-	r.next_span_id = 1
-	r.enabled      = true
-	r.worker       = thread.create_and_start_with_poly_data(r, worker_proc)
+	r.epoch_offset_ns = realtime_now_ns() - monotonic_now_ns()
+	r.next_span_id    = 1
+	r.enabled         = true
+
+	if r.cfg.backend == .Sleipnir_Actor {
+		if r.cfg.scheduler != nil {
+			r.sched       = r.cfg.scheduler
+			r.owned_sched = false
+		} else if amb_sched := actor.current_scheduler(); amb_sched != nil {
+			r.sched       = amb_sched
+			r.owned_sched = false
+		} else {
+			prev_amb := actor.current_scheduler()
+			r.sched = new(actor.Scheduler, allocator) or_return
+			sched_err := actor.scheduler_init(
+				r.sched,
+				actor.Scheduler_Config{
+					num_workers    = 1,
+					num_shards     = 1,
+					enable_parking = true,
+				},
+				allocator,
+			)
+			actor.use_scheduler(prev_amb)
+			if sched_err != nil {
+				free(r.sched, allocator)
+				r.sched = nil
+				return sched_err
+			}
+			actor.scheduler_start(r.sched)
+			r.owned_sched = true
+		}
+
+		r.flusher_actor = actor.spawn(
+			r.sched,
+			Flusher_Engine{r = r},
+			flusher_actor_receive,
+			0,
+			allocator,
+		) or_return
+
+		if !flusher_engine_init(&r.flusher_actor.state, r) {
+			return .Out_Of_Memory
+		}
+	} else {
+		r.worker = thread.create_and_start_with_poly_data(r, worker_proc)
+	}
 	return nil
 }
 
@@ -199,7 +336,21 @@ recorder_destroy :: proc(r: ^Recorder) {
 	sync.cond_broadcast(&r.cv_flush_done)
 	sync.mutex_unlock(&r.mu)
 
-	if r.worker != nil {
+	if r.cfg.backend == .Sleipnir_Actor {
+		if r.flusher_actor != nil {
+			flusher_engine_drain_ready_pages(&r.flusher_actor.state, true)
+			flusher_engine_destroy(&r.flusher_actor.state)
+			actor.destroy(r.flusher_actor)
+			r.flusher_actor = nil
+		}
+		if r.owned_sched && r.sched != nil {
+			sched_alloc := r.allocator
+			actor.scheduler_stop_and_destroy(r.sched)
+			free(r.sched, sched_alloc)
+			r.sched       = nil
+			r.owned_sched = false
+		}
+	} else if r.worker != nil {
 		thread.join(r.worker)
 		thread.destroy(r.worker)
 	}
@@ -226,11 +377,23 @@ recorder_flush :: proc(r: ^Recorder) {
 	if r == nil || !r.enabled {
 		return
 	}
+	if r.cfg.backend == .Sleipnir_Actor {
+		sync.mutex_lock(&r.mu)
+		if r.active_page_idx >= 0 && r.pages[r.active_page_idx].count > 0 {
+			rotate_active_page_locked(r)
+		}
+		sync.mutex_unlock(&r.mu)
+		if r.flusher_actor != nil {
+			flusher_engine_drain_ready_pages(&r.flusher_actor.state, true)
+		}
+		return
+	}
+
 	sync.mutex_lock(&r.mu)
 	defer sync.mutex_unlock(&r.mu)
 
 	if r.active_page_idx >= 0 && r.pages[r.active_page_idx].count > 0 {
-		_ = rotate_active_page_locked(r)
+		rotate_active_page_locked(r)
 	}
 	r.flush_requested = true
 	sync.cond_signal(&r.cv_work_ready)
@@ -246,8 +409,15 @@ recorder_set_worker_paused :: proc(r: ^Recorder, paused: bool) {
 	}
 	sync.mutex_lock(&r.mu)
 	r.worker_paused = paused
+	has_ready := len(r.ready_queue) > 0
 	if !paused {
-		sync.cond_signal(&r.cv_work_ready)
+		if r.cfg.backend == .Sleipnir_Actor {
+			if has_ready && r.flusher_actor != nil {
+				actor.send(r.sched, r.flusher_actor, Flusher_Msg{kind = .Drain_Ready})
+			}
+		} else {
+			sync.cond_signal(&r.cv_work_ready)
+		}
 	}
 	sync.mutex_unlock(&r.mu)
 }
@@ -258,8 +428,7 @@ recorder_set_worker_paused :: proc(r: ^Recorder, paused: bool) {
 
 Span_Guard :: struct {
 	recorder:       ^Recorder,
-	start_tick:     time.Tick,
-	timestamp_ns:   i64,
+	start_mono_ns:  i64,
 	span_id:        u64,
 	prev_parent:    u64,
 	prev_status:    Status,
@@ -316,8 +485,7 @@ span_begin :: #force_inline proc(
 
 	return Span_Guard{
 		recorder       = r,
-		start_tick     = time.tick_now(),
-		timestamp_ns   = time.now()._nsec,
+		start_mono_ns  = monotonic_now_ns(),
 		span_id        = id,
 		prev_parent    = parent,
 		prev_status    = prev_status,
@@ -359,7 +527,9 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	if g.recorder == nil {
 		return
 	}
-	dur_ns := i64(time.tick_since(g.start_tick))
+	end_mono_ns := monotonic_now_ns()
+	dur_ns      := max(end_mono_ns - g.start_mono_ns, 0)
+	ts_ns       := g.start_mono_ns + g.recorder.epoch_offset_ns
 
 	final_status := g.status   if g.status != .Ok                  else tls_active_span_status
 	final_attr   := g.attr_i64 if tls_active_span_attr == g.attr_i64 else tls_active_span_attr
@@ -368,19 +538,21 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	tls_active_span_status = g.prev_status
 	tls_active_span_attr   = g.prev_attr
 
-	record_raw(g.recorder, Record{
-		timestamp_ns = g.timestamp_ns,
-		duration_ns  = dur_ns,
-		span_id      = g.span_id,
-		parent_id    = g.prev_parent,
-		thread_id    = current_tid(),
-		kind         = .Span,
-		status       = final_status,
-		scope        = g.scope,
-		name         = g.name,
-		value_f64    = f64(dur_ns) / 1e6, // Convenience: duration in ms in value_f64
-		attr_i64     = final_attr,
-	}, g.strings_cloned)
+	record_raw(
+		g.recorder,
+		ts_ns,
+		dur_ns,
+		g.span_id,
+		g.prev_parent,
+		current_tid(),
+		.Span,
+		final_status,
+		g.scope,
+		g.name,
+		f64(dur_ns) / 1e6, // Convenience: duration in ms in value_f64
+		final_attr,
+		g.strings_cloned,
+	)
 }
 
 counter_add :: #force_inline proc(r: ^Recorder, scope, name: string, delta: f64 = 1.0, attr_i64: i64 = 0) {
@@ -420,19 +592,22 @@ emit_point :: #force_inline proc(
 	attr_i64: i64,
 	status: Status,
 ) {
-	record_raw(r, Record{
-		timestamp_ns = time.now()._nsec,
-		duration_ns  = 0,
-		span_id      = 0,
-		parent_id    = tls_active_span_id,
-		thread_id    = current_tid(),
-		kind         = kind,
-		status       = status,
-		scope        = scope,
-		name         = name,
-		value_f64    = val,
-		attr_i64     = attr_i64,
-	})
+	ts_ns := monotonic_now_ns() + r.epoch_offset_ns
+	record_raw(
+		r,
+		ts_ns,
+		0,
+		0,
+		tls_active_span_id,
+		current_tid(),
+		kind,
+		status,
+		scope,
+		name,
+		val,
+		attr_i64,
+		false,
+	)
 }
 
 // -----------------------------------------------------------------------------
@@ -440,56 +615,86 @@ emit_point :: #force_inline proc(
 // -----------------------------------------------------------------------------
 
 @(private)
-free_record_strings :: proc(rec: ^Record, allocator: mem.Allocator) {
-	if len(rec.scope) > 0 {
-		delete(rec.scope, allocator)
-		rec.scope = ""
+free_cloned_pair :: #force_inline proc(scope, name: string, allocator: mem.Allocator) {
+	if len(scope) > 0 {
+		delete(scope, allocator)
 	}
-	if len(rec.name) > 0 {
-		delete(rec.name, allocator)
-		rec.name = ""
+	if len(name) > 0 {
+		delete(name, allocator)
 	}
 }
 
 @(private)
-record_raw :: proc(r: ^Recorder, rec: Record, already_cloned := false) {
-	sync.mutex_lock(&r.mu)
-	defer sync.mutex_unlock(&r.mu)
+record_raw :: #force_inline proc(
+	r:              ^Recorder,
+	timestamp_ns:   i64,
+	duration_ns:    i64,
+	span_id:        u64,
+	parent_id:      u64,
+	thread_id:      u32,
+	kind:           Kind,
+	status:         Status,
+	scope:          string,
+	name:           string,
+	value_f64:      f64,
+	attr_i64:       i64,
+	already_cloned: bool = false,
+) {
+	stored_scope := scope
+	stored_name  := name
+	owns_strings := already_cloned
 
-	stored := rec
+	if r.cfg.string_Fallback_copy && !already_cloned {
+		if len(stored_scope) > 0 {
+			stored_scope = strings.clone(stored_scope, r.allocator)
+		}
+		if len(stored_name) > 0 {
+			stored_name = strings.clone(stored_name, r.allocator)
+		}
+		owns_strings = true
+	}
+
+	sync.mutex_lock(&r.mu)
+
 	if !r.enabled {
-		if already_cloned {
-			free_record_strings(&stored, r.allocator)
+		sync.mutex_unlock(&r.mu)
+		if owns_strings {
+			free_cloned_pair(stored_scope, stored_name, r.allocator)
 		}
 		return
 	}
 
 	if r.active_page_idx < 0 {
 		if !acquire_free_page_locked(r) {
-			if already_cloned {
-				free_record_strings(&stored, r.allocator)
+			sync.mutex_unlock(&r.mu)
+			if owns_strings {
+				free_cloned_pair(stored_scope, stored_name, r.allocator)
 			}
 			_ = intrinsics.atomic_add(&r.dropped_records, 1)
 			return
 		}
 	}
 
-	if r.cfg.string_Fallback_copy && !already_cloned {
-		if len(stored.scope) > 0 {
-			stored.scope = strings.clone(stored.scope, r.allocator)
-		}
-		if len(stored.name) > 0 {
-			stored.name = strings.clone(stored.name, r.allocator)
-		}
-	}
-
 	page := &r.pages[r.active_page_idx]
-	page.rows[page.count] = stored
-	page.count += 1
+	idx  := page.count
+	page.count = idx + 1
 
-	if page.count >= BATCH_CAP {
-		_ = rotate_active_page_locked(r)
+	page.rows.timestamp_ns[idx] = timestamp_ns
+	page.rows.duration_ns[idx]  = duration_ns
+	page.rows.span_id[idx]      = span_id
+	page.rows.parent_id[idx]    = parent_id
+	page.rows.thread_id[idx]    = thread_id
+	page.rows.kind[idx]         = kind
+	page.rows.status[idx]       = status
+	page.rows.scope[idx]        = stored_scope
+	page.rows.name[idx]         = stored_name
+	page.rows.value_f64[idx]    = value_f64
+	page.rows.attr_i64[idx]     = attr_i64
+
+	if idx + 1 >= BATCH_CAP {
+		rotate_active_page_locked(r)
 	}
+	sync.mutex_unlock(&r.mu)
 }
 
 @(private)
@@ -507,39 +712,61 @@ free_page_strings :: proc(page: ^Staging_Page, allocator: mem.Allocator) {
 }
 
 @(private)
-rotate_active_page_locked :: proc(r: ^Recorder) -> bool {
+rotate_active_page_locked :: proc(r: ^Recorder) {
+	was_empty := len(r.ready_queue) == 0
 	append(&r.ready_queue, r.active_page_idx)
-	r.active_page_idx = -1
-	sync.cond_signal(&r.cv_work_ready)
-	return acquire_free_page_locked(r)
+	if len(r.free_stack) > 0 {
+		next_idx := pop(&r.free_stack)
+		r.pages[next_idx].count = 0
+		r.active_page_idx = next_idx
+	} else {
+		r.active_page_idx = -1
+	}
+	if r.cfg.backend == .Sleipnir_Actor {
+		if was_empty && !r.worker_paused && r.flusher_actor != nil {
+			actor.send(r.sched, r.flusher_actor, Flusher_Msg{kind = .Drain_Ready})
+		}
+	} else {
+		sync.cond_signal(&r.cv_work_ready)
+	}
 }
 
 @(private)
 acquire_free_page_locked :: proc(r: ^Recorder) -> bool {
-	for len(r.free_stack) == 0 {
+	for r.active_page_idx < 0 {
+		if len(r.free_stack) > 0 {
+			idx := pop(&r.free_stack)
+			r.pages[idx].count = 0
+			r.active_page_idx  = idx
+			return true
+		}
 		if r.cfg.policy == .Drop || r.shutdown {
 			return false
 		}
+		if r.cfg.backend == .Sleipnir_Actor && !r.worker_paused && r.flusher_actor != nil {
+			sync.mutex_unlock(&r.mu)
+			flusher_engine_drain_ready_pages(&r.flusher_actor.state, false)
+			sync.mutex_lock(&r.mu)
+			continue
+		}
 		sync.cond_wait(&r.cv_page_free, &r.mu)
 	}
-	idx := pop(&r.free_stack)
-	r.pages[idx].count = 0
-	r.active_page_idx  = idx
 	return true
 }
 
 // -----------------------------------------------------------------------------
-// Single-Threaded Background OdinArrow Worker (Owns Buffer_Pool & Disk I/O)
+// Background OdinArrow Serializer (Shared by Dedicated Thread & Sleipnir Actor)
 // -----------------------------------------------------------------------------
 
 @(private)
-worker_proc :: proc(r: ^Recorder) {
-	// Buffer_Pool is owned 100% by this worker thread — zero mutex overhead!
-	pool: oa.Buffer_Pool
-	oa.buffer_pool_init(&pool, r.allocator)
-	defer oa.buffer_pool_destroy(&pool)
+flusher_engine_init :: proc(eng: ^Flusher_Engine, r: ^Recorder) -> bool {
+	eng.r        = r
+	eng.file_seq = 0
+	oa.buffer_pool_init(&eng.pool, r.allocator)
 
-	context.allocator = oa.buffer_pool_allocator(&pool)
+	prev_alloc := context.allocator
+	context.allocator = oa.buffer_pool_allocator(&eng.pool)
+	defer context.allocator = prev_alloc
 
 	schema, schema_err := oa.schema_make([]oa.Field{
 		oa.field_make("timestamp_ns", oa.Int64_Type{}),
@@ -555,69 +782,144 @@ worker_proc :: proc(r: ^Recorder) {
 		oa.field_make("attr_i64",     oa.Int64_Type{}),
 	})
 	if schema_err != nil {
+		oa.buffer_pool_destroy(&eng.pool)
+		return false
+	}
+	eng.schema = schema
+
+	batches, b_err := make([dynamic]oa.Record_Batch, 0, r.cfg.batches_per_file, r.allocator)
+	if b_err != nil {
+		oa.schema_free(&eng.schema)
+		oa.buffer_pool_destroy(&eng.pool)
+		return false
+	}
+	eng.segment_batches = batches
+	eng.initialized     = true
+	return true
+}
+
+@(private)
+flusher_engine_destroy :: proc(eng: ^Flusher_Engine) {
+	sync.mutex_lock(&eng.mu)
+	defer sync.mutex_unlock(&eng.mu)
+	if !eng.initialized {
 		return
 	}
-	defer oa.schema_free(&schema)
+	prev_alloc := context.allocator
+	context.allocator = oa.buffer_pool_allocator(&eng.pool)
 
-	segment_batches := make([dynamic]oa.Record_Batch, 0, r.cfg.batches_per_file, r.allocator)
-	defer delete(segment_batches)
+	for &b in eng.segment_batches {
+		oa.record_batch_free(&b)
+	}
+	delete(eng.segment_batches)
+	oa.schema_free(&eng.schema)
 
-	file_seq: u64 = 0
+	context.allocator = prev_alloc
+	oa.buffer_pool_destroy(&eng.pool)
+	eng.initialized = false
+}
+
+@(private)
+flusher_engine_flush_segment :: proc(eng: ^Flusher_Engine) {
+	if len(eng.segment_batches) == 0 {
+		return
+	}
+	r        := eng.r
+	filename := fmt.tprintf("%s_%06d.arrow", r.cfg.file_prefix, eng.file_seq)
+	_ = oa.ipc_write_file(filename, &eng.schema, eng.segment_batches[:])
+	eng.file_seq += 1
+
+	for &b in eng.segment_batches {
+		oa.record_batch_free(&b)
+	}
+	clear(&eng.segment_batches)
+	_ = intrinsics.atomic_add(&r.flushed_batches, 1)
+	free_all(context.temp_allocator)
+}
+
+@(private)
+flusher_engine_drain_ready_pages :: proc(eng: ^Flusher_Engine, force_flush: bool) {
+	sync.mutex_lock(&eng.mu)
+	defer sync.mutex_unlock(&eng.mu)
+	if !eng.initialized {
+		return
+	}
+	r := eng.r
+	prev_alloc := context.allocator
+	context.allocator = oa.buffer_pool_allocator(&eng.pool)
+	defer context.allocator = prev_alloc
+
+	for {
+		sync.mutex_lock(&r.mu)
+		if (r.worker_paused && !force_flush && !r.shutdown) || len(r.ready_queue) == 0 {
+			sync.mutex_unlock(&r.mu)
+			break
+		}
+		page_idx := r.ready_queue[0]
+		ordered_remove(&r.ready_queue, 0)
+		sync.mutex_unlock(&r.mu)
+
+		page := &r.pages[page_idx]
+		if batch, ok := build_arrow_batch(&eng.schema, page); ok {
+			append(&eng.segment_batches, batch)
+		}
+		if r.cfg.string_Fallback_copy {
+			free_page_strings(page, r.allocator)
+		}
+
+		// Return the #soa staging page immediately to producers
+		sync.mutex_lock(&r.mu)
+		page.count = 0
+		append(&r.free_stack, page_idx)
+		sync.cond_broadcast(&r.cv_page_free)
+		sync.mutex_unlock(&r.mu)
+
+		if len(eng.segment_batches) >= r.cfg.batches_per_file {
+			flusher_engine_flush_segment(eng)
+		}
+	}
+
+	if force_flush && len(eng.segment_batches) > 0 {
+		flusher_engine_flush_segment(eng)
+	}
+}
+
+@(private)
+flusher_actor_receive :: proc(ctx: ^actor.Context, state: ^Flusher_Engine, msg: ^Flusher_Msg) {
+	switch msg.kind {
+	case .Drain_Ready:
+		flusher_engine_drain_ready_pages(state, false)
+		actor.reply(ctx, true)
+	case .Flush_Sync:
+		flusher_engine_drain_ready_pages(state, true)
+		actor.reply(ctx, true)
+	case .Shutdown:
+		flusher_engine_drain_ready_pages(state, true)
+		flusher_engine_destroy(state)
+		actor.reply(ctx, true)
+	}
+}
+
+@(private)
+worker_proc :: proc(r: ^Recorder) {
+	eng: Flusher_Engine
+	if !flusher_engine_init(&eng, r) {
+		return
+	}
+	defer flusher_engine_destroy(&eng)
 
 	for {
 		sync.mutex_lock(&r.mu)
 		for ((len(r.ready_queue) == 0 && !r.flush_requested) || r.worker_paused) && !r.shutdown {
 			sync.cond_wait(&r.cv_work_ready, &r.mu)
 		}
-
-		has_page         := len(r.ready_queue) > 0
 		is_shutting_down := r.shutdown
 		is_flushing      := r.flush_requested
-		page_idx         := -1
-
-		if has_page {
-			page_idx = r.ready_queue[0]
-			ordered_remove(&r.ready_queue, 0)
-		}
-		queue_drained := len(r.ready_queue) == 0
 		sync.mutex_unlock(&r.mu)
 
-		if has_page {
-			page := &r.pages[page_idx]
-			if batch, ok := build_arrow_batch(&schema, page); ok {
-				append(&segment_batches, batch)
-			}
-			if r.cfg.string_Fallback_copy {
-				free_page_strings(page, r.allocator)
-			}
+		flusher_engine_drain_ready_pages(&eng, is_shutting_down || is_flushing)
 
-			// Return the #soa staging page immediately to producers
-			sync.mutex_lock(&r.mu)
-			page.count = 0
-			append(&r.free_stack, page_idx)
-			sync.cond_signal(&r.cv_page_free)
-			sync.mutex_unlock(&r.mu)
-		}
-
-		// Flush multi-batch .arrow segment file when full, on explicit flush, or on shutdown drain
-		should_flush := len(segment_batches) >= r.cfg.batches_per_file ||
-			((is_shutting_down || is_flushing) && queue_drained && len(segment_batches) > 0)
-
-		if should_flush {
-			filename := fmt.tprintf("%s_%06d.arrow", r.cfg.file_prefix, file_seq)
-			_ = oa.ipc_write_file(filename, &schema, segment_batches[:])
-			file_seq += 1
-
-			// Freeing all batches returns their backing buffers to `pool` for the next segment
-			for &b in segment_batches {
-				oa.record_batch_free(&b)
-			}
-			clear(&segment_batches)
-			_ = intrinsics.atomic_add(&r.flushed_batches, 1)
-			free_all(context.temp_allocator)
-		}
-
-		if is_flushing && queue_drained {
+		if is_flushing {
 			sync.mutex_lock(&r.mu)
 			if len(r.ready_queue) == 0 {
 				r.flush_requested = false
@@ -626,54 +928,93 @@ worker_proc :: proc(r: ^Recorder) {
 			sync.mutex_unlock(&r.mu)
 		}
 
-		if is_shutting_down && !has_page {
-			break
+		if is_shutting_down {
+			sync.mutex_lock(&r.mu)
+			done := len(r.ready_queue) == 0
+			sync.mutex_unlock(&r.mu)
+			if done {
+				break
+			}
 		}
+	}
+}
+
+@(private)
+build_primitive_column_from_soa :: #force_inline proc(
+	$T:      typeid,
+	dt:      oa.DataType,
+	src_ptr: [^]T,
+	n:       int,
+) -> oa.Array {
+	buf, _ := oa.buffer_make_uninit(BATCH_CAP * size_of(T))
+	buf.size = n * size_of(T)
+	if n > 0 {
+		mem.copy_non_overlapping(rawptr(buf.data), rawptr(src_ptr), n * size_of(T))
+	}
+	return oa.Array{
+		type       = dt,
+		length     = n,
+		null_count = 0,
+		offset     = 0,
+		buffers    = {{}, buf, {}},
+	}
+}
+
+@(private)
+build_string_column_from_soa :: #force_inline proc(
+	src_strings: [^]string,
+	n:           int,
+) -> oa.Array {
+	off_buf, _ := oa.buffer_make_uninit((BATCH_CAP + 1) * size_of(i32))
+	off_buf.size = (n + 1) * size_of(i32)
+	offsets := cast([^]i32)off_buf.data
+	offsets[0] = 0
+
+	total_bytes := 0
+	for i in 0 ..< n {
+		total_bytes += len(src_strings[i])
+		offsets[i + 1] = i32(total_bytes)
+	}
+
+	data_buf, _ := oa.buffer_make_uninit(max(total_bytes, 64))
+	data_buf.size = total_bytes
+	dst := data_buf.data
+	pos := 0
+	for i in 0 ..< n {
+		s := src_strings[i]
+		s_len := len(s)
+		if s_len > 0 {
+			mem.copy_non_overlapping(rawptr(&dst[pos]), rawptr(raw_data(s)), s_len)
+			pos += s_len
+		}
+	}
+
+	return oa.Array{
+		type       = oa.String_Type{},
+		length     = n,
+		null_count = 0,
+		offset     = 0,
+		buffers    = {{}, off_buf, data_buf},
 	}
 }
 
 @(private)
 build_arrow_batch :: proc(schema: ^oa.Schema, page: ^Staging_Page) -> (batch: oa.Record_Batch, ok: bool) {
 	n := page.count
-	// Always allocate builders with fixed BATCH_CAP so Buffer_Pool reuses identical size buckets
-	ts_b   := oa.builder_make(i64, BATCH_CAP)
-	dur_b  := oa.builder_make(i64, BATCH_CAP)
-	sid_b  := oa.builder_make(u64, BATCH_CAP)
-	pid_b  := oa.builder_make(u64, BATCH_CAP)
-	tid_b  := oa.builder_make(u32, BATCH_CAP)
-	kind_b := oa.builder_make(u8,  BATCH_CAP)
-	stat_b := oa.builder_make(u8,  BATCH_CAP)
-	scp_b  := oa.string_builder_make(BATCH_CAP)
-	name_b := oa.string_builder_make(BATCH_CAP)
-	val_b  := oa.builder_make(f64, BATCH_CAP)
-	attr_b := oa.builder_make(i64, BATCH_CAP)
 
-	// Because `page.rows` is `#soa[]Record`, each field is already a contiguous array!
-	for i in 0 ..< n {
-		oa.builder_append(&ts_b,   page.rows.timestamp_ns[i])
-		oa.builder_append(&dur_b,  page.rows.duration_ns[i])
-		oa.builder_append(&sid_b,  page.rows.span_id[i])
-		oa.builder_append(&pid_b,  page.rows.parent_id[i])
-		oa.builder_append(&tid_b,  page.rows.thread_id[i])
-		oa.builder_append(&kind_b, u8(page.rows.kind[i]))
-		oa.builder_append(&stat_b, u8(page.rows.status[i]))
-		oa.string_builder_append(&scp_b,  page.rows.scope[i])
-		oa.string_builder_append(&name_b, page.rows.name[i])
-		oa.builder_append(&val_b,  page.rows.value_f64[i])
-		oa.builder_append(&attr_b, page.rows.attr_i64[i])
-	}
-
-	ts_col,   _ := oa.builder_finish(&ts_b);   oa.builder_destroy(&ts_b)
-	dur_col,  _ := oa.builder_finish(&dur_b);  oa.builder_destroy(&dur_b)
-	sid_col,  _ := oa.builder_finish(&sid_b);  oa.builder_destroy(&sid_b)
-	pid_col,  _ := oa.builder_finish(&pid_b);  oa.builder_destroy(&pid_b)
-	tid_col,  _ := oa.builder_finish(&tid_b);  oa.builder_destroy(&tid_b)
-	kind_col, _ := oa.builder_finish(&kind_b); oa.builder_destroy(&kind_b)
-	stat_col, _ := oa.builder_finish(&stat_b); oa.builder_destroy(&stat_b)
-	scp_col,  _ := oa.string_builder_finish(&scp_b);  oa.string_builder_destroy(&scp_b)
-	name_col, _ := oa.string_builder_finish(&name_b); oa.string_builder_destroy(&name_b)
-	val_col,  _ := oa.builder_finish(&val_b);  oa.builder_destroy(&val_b)
-	attr_col, _ := oa.builder_finish(&attr_b); oa.builder_destroy(&attr_b)
+	// Bulk-copy each contiguous `#soa` primitive column slice directly into an
+	// Arrow Buffer_Pool buffer (single `memcpy` per column, zero bitmap allocs).
+	ts_col   := build_primitive_column_from_soa(i64, oa.Int64_Type{},   page.rows.timestamp_ns,     n)
+	dur_col  := build_primitive_column_from_soa(i64, oa.Int64_Type{},   page.rows.duration_ns,      n)
+	sid_col  := build_primitive_column_from_soa(u64, oa.UInt64_Type{},  page.rows.span_id,          n)
+	pid_col  := build_primitive_column_from_soa(u64, oa.UInt64_Type{},  page.rows.parent_id,        n)
+	tid_col  := build_primitive_column_from_soa(u32, oa.UInt32_Type{},  page.rows.thread_id,        n)
+	kind_col := build_primitive_column_from_soa(u8,  oa.UInt8_Type{},   cast([^]u8)page.rows.kind,   n)
+	stat_col := build_primitive_column_from_soa(u8,  oa.UInt8_Type{},   cast([^]u8)page.rows.status, n)
+	scp_col  := build_string_column_from_soa(page.rows.scope, n)
+	name_col := build_string_column_from_soa(page.rows.name,  n)
+	val_col  := build_primitive_column_from_soa(f64, oa.Float64_Type{}, page.rows.value_f64,        n)
+	attr_col := build_primitive_column_from_soa(i64, oa.Int64_Type{},   page.rows.attr_i64,         n)
 
 	return oa.record_batch_make(schema, []oa.Array{
 		ts_col, dur_col, sid_col, pid_col, tid_col,

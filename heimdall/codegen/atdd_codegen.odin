@@ -562,7 +562,7 @@ analyze_spec_ast :: proc(
 	for decl_stmt in file.decls {
 		#partial switch d in decl_stmt.derived {
 		case ^ast.Import_Decl:
-			if strings.contains(d.fullpath, "OdinArrow") {
+			if strings.contains(d.fullpath, "OdinArrow") || strings.contains(d.fullpath, "sleipnir") {
 				report.forbidden_imports += 1
 			}
 		case ^ast.Value_Decl:

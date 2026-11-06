@@ -596,3 +596,64 @@ spec_three_level_nested_and_sibling_spans_unwind_thread_local_context_to_root ::
 	)
 }
 
+@(test)
+spec_sleipnir_actor_backend_standalone_flushes_and_rotates_multi_segment_arrow_files :: proc(t: ^testing.T) {
+	_ = scenario(t)
+
+	// Configure with `backend = .Sleipnir_Actor` and `shared_scheduler_workers = 0` (standalone owned 1-worker Scheduler)
+	given.recorder_configured(
+		batches_per_file         = 2,
+		ring_pages               = 3,
+		string_copy              = false,
+		policy                   = .Block,
+		backend                  = .Sleipnir_Actor,
+		shared_scheduler_workers = 0,
+	)
+
+	// 2,250 HTTP requests * 4 records/request = 9,000 total records:
+	//   - Segment 0 (`_000000.arrow`): 2 full batches of 4,096 rows = 8,192 rows flushed asynchronously via `actor.send(.Drain)`
+	//   - Segment 1 (`_000001.arrow`): 1 partial batch of 808 rows flushed synchronously via `actor.call(.Flush)`
+	upon.simulating_http_requests(count = 2250, payload_step_bytes = 16)
+	upon.flushing_live_recorder(expected_flushed_segments = 2)
+	upon.flushing_and_shutting_down_recorder(flush_first = false)
+
+	then.recorder_diagnostics_are(expected_flushed_segments = 2, expected_dropped_records = 0)
+
+	then.arrow_segment_exists_is(segment_idx = 0, expected_exist = true)
+	then.arrow_segment_batch_count_is(segment_idx = 0, expected_batches = 2)
+	then.arrow_batch_row_count_is(segment_idx = 0, batch_idx = 0, expected_rows = 4096)
+	then.arrow_batch_row_count_is(segment_idx = 0, batch_idx = 1, expected_rows = 4096)
+
+	then.arrow_segment_exists_is(segment_idx = 1, expected_exist = true)
+	then.arrow_segment_batch_count_is(segment_idx = 1, expected_batches = 1)
+	then.arrow_batch_row_count_is(segment_idx = 1, batch_idx = 0, expected_rows = 808)
+}
+
+@(test)
+spec_sleipnir_actor_backend_shares_scheduler_with_application_actors_and_preserves_span_trees :: proc(t: ^testing.T) {
+	_ = scenario(t)
+
+	// Configure with `backend = .Sleipnir_Actor` attached to an external 4-worker `actor.Scheduler`
+	given.recorder_configured(
+		batches_per_file         = 4,
+		ring_pages               = 4,
+		string_copy              = false,
+		policy                   = .Block,
+		backend                  = .Sleipnir_Actor,
+		shared_scheduler_workers = 4,
+	)
+
+	// 4 Sleipnir actors * 150 messages * 4 records/message = 2,400 rows (1,200 spans, 600 root spans)
+	// sharing the same 4-worker `actor.Scheduler` as Heimdall's internal `Flusher_Engine` actor
+	upon.running_sleipnir_actor_producers(actor_count = 4, messages_per_actor = 150)
+	upon.flushing_and_shutting_down_recorder(flush_first = false)
+
+	then.recorder_diagnostics_are(expected_flushed_segments = 1, expected_dropped_records = 0)
+	then.multithreaded_span_trees_are_isolated(
+		expected_total_rows   = 2400,
+		expected_unique_spans = 1200,
+		expected_root_spans   = 600,
+		expected_min_threads  = 2,
+	)
+}
+

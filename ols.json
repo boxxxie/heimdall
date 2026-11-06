@@ -2,7 +2,8 @@
 	"$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
 	"collections": [
 		{ "name": "heimdall", "path": "./heimdall" },
-		{ "name": "odinarrow", "path": "./deps/OdinArrow/src" }
+		{ "name": "odinarrow", "path": "./deps/OdinArrow/src" },
+		{ "name": "actor", "path": "./deps/sleipnir/actor" }
 	],
 	"enable_document_symbols": true,
 	"enable_hover": true,
@@ -10,5 +11,5 @@
 	"enable_semantic_tokens": true,
 	"enable_inlay_hints": true,
 	"enable_checker_only_saved": true,
-	"checker_args": "-vet -strict-style -vet-tabs -vet-packages:heimdall,heimdall_codegen,heimdall_tests"
+	"checker_args": "-vet -strict-style -vet-tabs -vet-packages:heimdall,heimdall_codegen,heimdall_tests,heimdall_benchmarks"
 }

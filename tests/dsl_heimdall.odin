@@ -12,14 +12,16 @@ import "../heimdall"
 // =============================================================================
 
 given_recorder_configured :: proc(
-	s:                ^Suite_Ctx,
-	batches_per_file: int = 2,
-	ring_pages:       int = 3,
-	string_copy:      bool = false,
-	policy:           heimdall.Backpressure_Policy = .Block,
+	s:                        ^Suite_Ctx,
+	batches_per_file:         int = 2,
+	ring_pages:               int = 3,
+	string_copy:              bool = false,
+	policy:                   heimdall.Backpressure_Policy = .Block,
+	backend:                  heimdall.Backend_Mode = .Dedicated_Thread,
+	shared_scheduler_workers: int = 0,
 	loc := #caller_location,
 ) {
-	ok := driver_configure_recorder(s, batches_per_file, ring_pages, string_copy, policy)
+	ok := driver_configure_recorder(s, batches_per_file, ring_pages, string_copy, policy, backend, shared_scheduler_workers)
 	testing.expect(s.t, ok, "Expected recorder_init to succeed", loc = loc)
 }
 
@@ -73,6 +75,16 @@ upon_running_concurrent_http_producers :: proc(
 	iterations_per_thread: int,
 ) {
 	driver_run_concurrent_producers(s, thread_count, iterations_per_thread)
+}
+
+upon_running_sleipnir_actor_producers :: proc(
+	s:                  ^Suite_Ctx,
+	actor_count:        int,
+	messages_per_actor: int,
+	loc := #caller_location,
+) {
+	ok := driver_run_sleipnir_actor_producers(s, actor_count, messages_per_actor)
+	testing.expect(s.t, ok, "Expected Sleipnir actor producers to execute and drain on shared Scheduler", loc = loc)
 }
 
 upon_emitting_saturation_burst :: proc(

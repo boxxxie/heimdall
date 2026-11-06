@@ -1,3 +1,6 @@
 [submodule "deps/OdinArrow"]
 	path = deps/OdinArrow
 	url = https://github.com/TimeLord/OdinArrow.git
+[submodule "deps/sleipnir"]
+	path = deps/sleipnir
+	url = https://github.com/boxxxie/sleipnir.git
