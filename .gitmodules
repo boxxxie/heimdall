@@ -1,0 +1,3 @@
+[submodule "deps/OdinArrow"]
+	path = deps/OdinArrow
+	url = https://github.com/TimeLord/OdinArrow.git
