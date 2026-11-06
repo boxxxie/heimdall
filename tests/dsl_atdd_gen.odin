@@ -35,6 +35,7 @@ Scenario_Handle :: struct {
 
 @(deferred_out = scenario_scope_end)
 scenario :: proc(t: ^testing.T, loc := #caller_location) -> Scenario_Handle {
+	assert(_active_scenario_ctx == nil, "Active ATDD scenario already running in this scope; wrap sequential scenarios in { } blocks", loc)
 	assert(_scenario_depth < MAX_SCENARIO_DEPTH, "MAX_SCENARIO_DEPTH exceeded; wrap sequential scenarios in { } blocks", loc)
 	s := &_scenario_stack[_scenario_depth]
 	_scenario_depth += 1
@@ -55,23 +56,27 @@ scenario_scope_end :: proc(h: Scenario_Handle) {
 }
 
 Suite_Ctx_VTable :: struct {
-	given_recorder_configured: proc(s: ^Suite_Ctx, batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location),
+	given_recorder_configured: proc(s: ^Suite_Ctx, batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, custom_prefix: string = "", loc := #caller_location),
 	given_zero_config_recorder_initialized: proc(s: ^Suite_Ctx, loc := #caller_location),
 	given_recorder_enabled_state: proc(s: ^Suite_Ctx, enabled: bool),
+	given_worker_paused: proc(s: ^Suite_Ctx, paused: bool),
 	given_registered_as_default_recorder: proc(s: ^Suite_Ctx, loc := #caller_location),
 	upon_simulating_http_requests_with_nil_recorder: proc(s: ^Suite_Ctx, count: int, payload_bytes: int),
 	upon_simulating_http_requests: proc(s: ^Suite_Ctx, count: int, payload_step_bytes: int),
 	upon_running_concurrent_http_producers: proc(s: ^Suite_Ctx, thread_count: int, iterations_per_thread: int),
 	upon_running_sleipnir_actor_producers: proc(s: ^Suite_Ctx, actor_count: int, messages_per_actor: int, loc := #caller_location),
 	upon_emitting_saturation_burst: proc(s: ^Suite_Ctx, total_events: int),
+	upon_emitting_events_and_flushing_with_live_temp_canary: proc(s: ^Suite_Ctx, total_events: int, loc := #caller_location),
+	then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf: proc(s: ^Suite_Ctx, cycles: int, events_per_cycle: int, expected_min_flushed_batches: u64, loc := #caller_location),
 	upon_emitting_dynamic_string_telemetry: proc(s: ^Suite_Ctx, count: int, use_default_recorder: bool = true),
 	upon_emitting_dynamic_scoped_spans: proc(s: ^Suite_Ctx, count: int, pause_worker: bool = false),
 	upon_running_blocking_producer_with_delayed_worker_unpause: proc(s: ^Suite_Ctx, total_events: int, loc := #caller_location),
 	upon_simulating_three_level_and_sibling_call_tree: proc(s: ^Suite_Ctx, iterations: int = 1),
 	upon_recording_all_telemetry_kinds: proc(s: ^Suite_Ctx, scope: string, metric_name: string, counter_delta: f64, gauge_val: f64, hist_sample: f64, event_attr: i64, event_status: heimdall.Status = .Ok),
 	upon_simulating_fallback_http_request: proc(s: ^Suite_Ctx, initial_http_tag: i64, child_err_code: i64, propagate_err: bool = false, parent_err_code: i64 = 0),
+	upon_mutating_span_guard_attr_and_recording_negative_gauge: proc(s: ^Suite_Ctx, initial_attr: i64, mutated_attr: i64, negative_gauge_val: f64),
 	upon_flushing_live_recorder: proc(s: ^Suite_Ctx, expected_flushed_segments: u64, loc := #caller_location),
-	upon_flushing_and_shutting_down_recorder: proc(s: ^Suite_Ctx, flush_first: bool = false),
+	upon_flushing_and_shutting_down_recorder: proc(s: ^Suite_Ctx, flush_first: bool = false, loc := #caller_location),
 	then_recorder_default_config_is: proc(s: ^Suite_Ctx, expected_prefix: string, expected_batches_file: int, expected_ring_pages: int, loc := #caller_location),
 	then_oom_recorder_init_rolls_back_and_destroys_cleanly: proc(s: ^Suite_Ctx, arena_bytes: int, requested_pages: int, loc := #caller_location),
 	then_recorder_diagnostics_are: proc(s: ^Suite_Ctx, expected_flushed_segments: u64, expected_dropped_records: u64, loc := #caller_location),
@@ -79,10 +84,17 @@ Suite_Ctx_VTable :: struct {
 	then_arrow_segment_exists_is: proc(s: ^Suite_Ctx, segment_idx: int, expected_exist: bool, loc := #caller_location),
 	then_arrow_segment_batch_count_is: proc(s: ^Suite_Ctx, segment_idx: int, expected_batches: int, loc := #caller_location),
 	then_arrow_batch_row_count_is: proc(s: ^Suite_Ctx, segment_idx: int, batch_idx: int, expected_rows: int, loc := #caller_location),
-	then_telemetry_row_matches: proc(s: ^Suite_Ctx, segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: f64 = -1.0, loc := #caller_location),
+	then_telemetry_row_matches: proc(s: ^Suite_Ctx, segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: Maybe(f64) = nil, loc := #caller_location),
+	then_multi_recorder_same_thread_spans_are_isolated: proc(s: ^Suite_Ctx, expected_rec_a_rows: int, expected_rec_b_rows: int, loc := #caller_location),
 	then_multithreaded_span_trees_are_isolated: proc(s: ^Suite_Ctx, expected_total_rows: int, expected_unique_spans: int, expected_root_spans: int, expected_min_threads: int, loc := #caller_location),
 	then_ast_enforces_four_layer_atdd_contract: proc(s: ^Suite_Ctx, tests_dir: string, sut_dir: string, loc := #caller_location),
-	then_ast_detects_layer_violations_in_synthetic_spec: proc(s: ^Suite_Ctx, synthetic_spec_src: string, synthetic_dsl_src: string, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
+	then_ast_detects_layer_violations_in_synthetic_spec: proc(s: ^Suite_Ctx, synthetic_spec_src: string, synthetic_dsl_src: string, expected_non_test_procs: int, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
+	then_ast_analyzes_telemetry_call_sites: proc(s: ^Suite_Ctx, instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location),
+	then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist: proc(s: ^Suite_Ctx, thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location),
+	upon_running_blocking_producer_woken_by_disable: proc(s: ^Suite_Ctx, total_events: int, loc := #caller_location),
+	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(s: ^Suite_Ctx, expected_flushed_batches: int, loc := #caller_location),
+	then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema: proc(s: ^Suite_Ctx, expected_custom_schema_cols: int, loc := #caller_location),
+	then_live_flushes_complete_under_continuous_producer_load: proc(s: ^Suite_Ctx, producer_count: int, flush_calls: int, loc := #caller_location),
 }
 
 @(private)
@@ -91,18 +103,22 @@ _suite_ctx_vtable := Suite_Ctx_VTable{
 	given_recorder_configured = given_recorder_configured,
 	given_zero_config_recorder_initialized = given_zero_config_recorder_initialized,
 	given_recorder_enabled_state = given_recorder_enabled_state,
+	given_worker_paused = given_worker_paused,
 	given_registered_as_default_recorder = given_registered_as_default_recorder,
 	upon_simulating_http_requests_with_nil_recorder = upon_simulating_http_requests_with_nil_recorder,
 	upon_simulating_http_requests = upon_simulating_http_requests,
 	upon_running_concurrent_http_producers = upon_running_concurrent_http_producers,
 	upon_running_sleipnir_actor_producers = upon_running_sleipnir_actor_producers,
 	upon_emitting_saturation_burst = upon_emitting_saturation_burst,
+	upon_emitting_events_and_flushing_with_live_temp_canary = upon_emitting_events_and_flushing_with_live_temp_canary,
+	then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf = then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf,
 	upon_emitting_dynamic_string_telemetry = upon_emitting_dynamic_string_telemetry,
 	upon_emitting_dynamic_scoped_spans = upon_emitting_dynamic_scoped_spans,
 	upon_running_blocking_producer_with_delayed_worker_unpause = upon_running_blocking_producer_with_delayed_worker_unpause,
 	upon_simulating_three_level_and_sibling_call_tree = upon_simulating_three_level_and_sibling_call_tree,
 	upon_recording_all_telemetry_kinds = upon_recording_all_telemetry_kinds,
 	upon_simulating_fallback_http_request = upon_simulating_fallback_http_request,
+	upon_mutating_span_guard_attr_and_recording_negative_gauge = upon_mutating_span_guard_attr_and_recording_negative_gauge,
 	upon_flushing_live_recorder = upon_flushing_live_recorder,
 	upon_flushing_and_shutting_down_recorder = upon_flushing_and_shutting_down_recorder,
 	then_recorder_default_config_is = then_recorder_default_config_is,
@@ -113,15 +129,23 @@ _suite_ctx_vtable := Suite_Ctx_VTable{
 	then_arrow_segment_batch_count_is = then_arrow_segment_batch_count_is,
 	then_arrow_batch_row_count_is = then_arrow_batch_row_count_is,
 	then_telemetry_row_matches = then_telemetry_row_matches,
+	then_multi_recorder_same_thread_spans_are_isolated = then_multi_recorder_same_thread_spans_are_isolated,
 	then_multithreaded_span_trees_are_isolated = then_multithreaded_span_trees_are_isolated,
 	then_ast_enforces_four_layer_atdd_contract = then_ast_enforces_four_layer_atdd_contract,
 	then_ast_detects_layer_violations_in_synthetic_spec = then_ast_detects_layer_violations_in_synthetic_spec,
+	then_ast_analyzes_telemetry_call_sites = then_ast_analyzes_telemetry_call_sites,
+	then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist = then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist,
+	upon_running_blocking_producer_woken_by_disable = upon_running_blocking_producer_woken_by_disable,
+	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly = then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly,
+	then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema = then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema,
+	then_live_flushes_complete_under_continuous_producer_load = then_live_flushes_complete_under_continuous_producer_load,
 }
 
 Given_DSL :: struct {
-	recorder_configured: proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location),
+	recorder_configured: proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, custom_prefix: string = "", loc := #caller_location),
 	zero_config_recorder_initialized: proc(loc := #caller_location),
 	recorder_enabled_state: proc(enabled: bool),
+	worker_paused: proc(paused: bool),
 	registered_as_default_recorder: proc(loc := #caller_location),
 }
 
@@ -130,6 +154,7 @@ given := Given_DSL{
 	recorder_configured = given_recorder_configured_ambient,
 	zero_config_recorder_initialized = given_zero_config_recorder_initialized_ambient,
 	recorder_enabled_state = given_recorder_enabled_state_ambient,
+	worker_paused = given_worker_paused_ambient,
 	registered_as_default_recorder = given_registered_as_default_recorder_ambient,
 }
 
@@ -139,14 +164,17 @@ Upon_DSL :: struct {
 	running_concurrent_http_producers: proc(thread_count: int, iterations_per_thread: int),
 	running_sleipnir_actor_producers: proc(actor_count: int, messages_per_actor: int, loc := #caller_location),
 	emitting_saturation_burst: proc(total_events: int),
+	emitting_events_and_flushing_with_live_temp_canary: proc(total_events: int, loc := #caller_location),
 	emitting_dynamic_string_telemetry: proc(count: int, use_default_recorder: bool = true),
 	emitting_dynamic_scoped_spans: proc(count: int, pause_worker: bool = false),
 	running_blocking_producer_with_delayed_worker_unpause: proc(total_events: int, loc := #caller_location),
 	simulating_three_level_and_sibling_call_tree: proc(iterations: int = 1),
 	recording_all_telemetry_kinds: proc(scope: string, metric_name: string, counter_delta: f64, gauge_val: f64, hist_sample: f64, event_attr: i64, event_status: heimdall.Status = .Ok),
 	simulating_fallback_http_request: proc(initial_http_tag: i64, child_err_code: i64, propagate_err: bool = false, parent_err_code: i64 = 0),
+	mutating_span_guard_attr_and_recording_negative_gauge: proc(initial_attr: i64, mutated_attr: i64, negative_gauge_val: f64),
 	flushing_live_recorder: proc(expected_flushed_segments: u64, loc := #caller_location),
-	flushing_and_shutting_down_recorder: proc(flush_first: bool = false),
+	flushing_and_shutting_down_recorder: proc(flush_first: bool = false, loc := #caller_location),
+	running_blocking_producer_woken_by_disable: proc(total_events: int, loc := #caller_location),
 }
 
 @(rodata)
@@ -156,17 +184,21 @@ upon := Upon_DSL{
 	running_concurrent_http_producers = upon_running_concurrent_http_producers_ambient,
 	running_sleipnir_actor_producers = upon_running_sleipnir_actor_producers_ambient,
 	emitting_saturation_burst = upon_emitting_saturation_burst_ambient,
+	emitting_events_and_flushing_with_live_temp_canary = upon_emitting_events_and_flushing_with_live_temp_canary_ambient,
 	emitting_dynamic_string_telemetry = upon_emitting_dynamic_string_telemetry_ambient,
 	emitting_dynamic_scoped_spans = upon_emitting_dynamic_scoped_spans_ambient,
 	running_blocking_producer_with_delayed_worker_unpause = upon_running_blocking_producer_with_delayed_worker_unpause_ambient,
 	simulating_three_level_and_sibling_call_tree = upon_simulating_three_level_and_sibling_call_tree_ambient,
 	recording_all_telemetry_kinds = upon_recording_all_telemetry_kinds_ambient,
 	simulating_fallback_http_request = upon_simulating_fallback_http_request_ambient,
+	mutating_span_guard_attr_and_recording_negative_gauge = upon_mutating_span_guard_attr_and_recording_negative_gauge_ambient,
 	flushing_live_recorder = upon_flushing_live_recorder_ambient,
 	flushing_and_shutting_down_recorder = upon_flushing_and_shutting_down_recorder_ambient,
+	running_blocking_producer_woken_by_disable = upon_running_blocking_producer_woken_by_disable_ambient,
 }
 
 Then_DSL :: struct {
+	sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf: proc(cycles: int, events_per_cycle: int, expected_min_flushed_batches: u64, loc := #caller_location),
 	recorder_default_config_is: proc(expected_prefix: string, expected_batches_file: int, expected_ring_pages: int, loc := #caller_location),
 	oom_recorder_init_rolls_back_and_destroys_cleanly: proc(arena_bytes: int, requested_pages: int, loc := #caller_location),
 	recorder_diagnostics_are: proc(expected_flushed_segments: u64, expected_dropped_records: u64, loc := #caller_location),
@@ -174,14 +206,21 @@ Then_DSL :: struct {
 	arrow_segment_exists_is: proc(segment_idx: int, expected_exist: bool, loc := #caller_location),
 	arrow_segment_batch_count_is: proc(segment_idx: int, expected_batches: int, loc := #caller_location),
 	arrow_batch_row_count_is: proc(segment_idx: int, batch_idx: int, expected_rows: int, loc := #caller_location),
-	telemetry_row_matches: proc(segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: f64 = -1.0, loc := #caller_location),
+	telemetry_row_matches: proc(segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: Maybe(f64) = nil, loc := #caller_location),
+	multi_recorder_same_thread_spans_are_isolated: proc(expected_rec_a_rows: int, expected_rec_b_rows: int, loc := #caller_location),
 	multithreaded_span_trees_are_isolated: proc(expected_total_rows: int, expected_unique_spans: int, expected_root_spans: int, expected_min_threads: int, loc := #caller_location),
 	ast_enforces_four_layer_atdd_contract: proc(tests_dir: string, sut_dir: string, loc := #caller_location),
-	ast_detects_layer_violations_in_synthetic_spec: proc(synthetic_spec_src: string, synthetic_dsl_src: string, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
+	ast_detects_layer_violations_in_synthetic_spec: proc(synthetic_spec_src: string, synthetic_dsl_src: string, expected_non_test_procs: int, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
+	ast_analyzes_telemetry_call_sites: proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location),
+	multithreaded_dynamic_strings_with_unsynchronized_arena_persist: proc(thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location),
+	partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(expected_flushed_batches: int, loc := #caller_location),
+	ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema: proc(expected_custom_schema_cols: int, loc := #caller_location),
+	live_flushes_complete_under_continuous_producer_load: proc(producer_count: int, flush_calls: int, loc := #caller_location),
 }
 
 @(rodata)
 then := Then_DSL{
+	sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf = then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf_ambient,
 	recorder_default_config_is = then_recorder_default_config_is_ambient,
 	oom_recorder_init_rolls_back_and_destroys_cleanly = then_oom_recorder_init_rolls_back_and_destroys_cleanly_ambient,
 	recorder_diagnostics_are = then_recorder_diagnostics_are_ambient,
@@ -190,17 +229,23 @@ then := Then_DSL{
 	arrow_segment_batch_count_is = then_arrow_segment_batch_count_is_ambient,
 	arrow_batch_row_count_is = then_arrow_batch_row_count_is_ambient,
 	telemetry_row_matches = then_telemetry_row_matches_ambient,
+	multi_recorder_same_thread_spans_are_isolated = then_multi_recorder_same_thread_spans_are_isolated_ambient,
 	multithreaded_span_trees_are_isolated = then_multithreaded_span_trees_are_isolated_ambient,
 	ast_enforces_four_layer_atdd_contract = then_ast_enforces_four_layer_atdd_contract_ambient,
 	ast_detects_layer_violations_in_synthetic_spec = then_ast_detects_layer_violations_in_synthetic_spec_ambient,
+	ast_analyzes_telemetry_call_sites = then_ast_analyzes_telemetry_call_sites_ambient,
+	multithreaded_dynamic_strings_with_unsynchronized_arena_persist = then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist_ambient,
+	partial_batch_oom_and_string_offset_overflow_roll_back_cleanly = then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly_ambient,
+	ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema = then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema_ambient,
+	live_flushes_complete_under_continuous_producer_load = then_live_flushes_complete_under_continuous_producer_load_ambient,
 }
 
 // =============================================================================
 // Ambient Step Wrappers & Procedure Overload Groups (for `*_ctx` steps)
 // =============================================================================
 
-given_recorder_configured_ambient :: #force_inline proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, loc := #caller_location) {
-	given_recorder_configured(current_scenario(loc), batches_per_file, ring_pages, string_copy, policy, backend, shared_scheduler_workers, loc)
+given_recorder_configured_ambient :: #force_inline proc(batches_per_file: int = 2, ring_pages: int = 3, string_copy: bool = false, policy: heimdall.Backpressure_Policy = .Block, backend: heimdall.Backend_Mode = .Dedicated_Thread, shared_scheduler_workers: int = 0, custom_prefix: string = "", loc := #caller_location) {
+	given_recorder_configured(current_scenario(loc), batches_per_file, ring_pages, string_copy, policy, backend, shared_scheduler_workers, custom_prefix, loc)
 }
 
 given_zero_config_recorder_initialized_ambient :: #force_inline proc(loc := #caller_location) {
@@ -209,6 +254,10 @@ given_zero_config_recorder_initialized_ambient :: #force_inline proc(loc := #cal
 
 given_recorder_enabled_state_ambient :: #force_inline proc(enabled: bool) {
 	given_recorder_enabled_state(current_scenario(), enabled)
+}
+
+given_worker_paused_ambient :: #force_inline proc(paused: bool) {
+	given_worker_paused(current_scenario(), paused)
 }
 
 given_registered_as_default_recorder_ambient :: #force_inline proc(loc := #caller_location) {
@@ -235,6 +284,14 @@ upon_emitting_saturation_burst_ambient :: #force_inline proc(total_events: int) 
 	upon_emitting_saturation_burst(current_scenario(), total_events)
 }
 
+upon_emitting_events_and_flushing_with_live_temp_canary_ambient :: #force_inline proc(total_events: int, loc := #caller_location) {
+	upon_emitting_events_and_flushing_with_live_temp_canary(current_scenario(loc), total_events, loc)
+}
+
+then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf_ambient :: #force_inline proc(cycles: int, events_per_cycle: int, expected_min_flushed_batches: u64, loc := #caller_location) {
+	then_sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf(current_scenario(loc), cycles, events_per_cycle, expected_min_flushed_batches, loc)
+}
+
 upon_emitting_dynamic_string_telemetry_ambient :: #force_inline proc(count: int, use_default_recorder: bool = true) {
 	upon_emitting_dynamic_string_telemetry(current_scenario(), count, use_default_recorder)
 }
@@ -259,12 +316,16 @@ upon_simulating_fallback_http_request_ambient :: #force_inline proc(initial_http
 	upon_simulating_fallback_http_request(current_scenario(), initial_http_tag, child_err_code, propagate_err, parent_err_code)
 }
 
+upon_mutating_span_guard_attr_and_recording_negative_gauge_ambient :: #force_inline proc(initial_attr: i64, mutated_attr: i64, negative_gauge_val: f64) {
+	upon_mutating_span_guard_attr_and_recording_negative_gauge(current_scenario(), initial_attr, mutated_attr, negative_gauge_val)
+}
+
 upon_flushing_live_recorder_ambient :: #force_inline proc(expected_flushed_segments: u64, loc := #caller_location) {
 	upon_flushing_live_recorder(current_scenario(loc), expected_flushed_segments, loc)
 }
 
-upon_flushing_and_shutting_down_recorder_ambient :: #force_inline proc(flush_first: bool = false) {
-	upon_flushing_and_shutting_down_recorder(current_scenario(), flush_first)
+upon_flushing_and_shutting_down_recorder_ambient :: #force_inline proc(flush_first: bool = false, loc := #caller_location) {
+	upon_flushing_and_shutting_down_recorder(current_scenario(loc), flush_first, loc)
 }
 
 then_recorder_default_config_is_ambient :: #force_inline proc(expected_prefix: string, expected_batches_file: int, expected_ring_pages: int, loc := #caller_location) {
@@ -295,8 +356,12 @@ then_arrow_batch_row_count_is_ambient :: #force_inline proc(segment_idx: int, ba
 	then_arrow_batch_row_count_is(current_scenario(loc), segment_idx, batch_idx, expected_rows, loc)
 }
 
-then_telemetry_row_matches_ambient :: #force_inline proc(segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: f64 = -1.0, loc := #caller_location) {
+then_telemetry_row_matches_ambient :: #force_inline proc(segment_idx: int, batch_idx: int, row_idx: int, expected_kind: heimdall.Kind, expected_status: heimdall.Status, expected_scope: string, expected_name: string, expected_span_id: u64, expected_parent_id: u64, expected_attr_i64: i64, expected_value_f64: Maybe(f64) = nil, loc := #caller_location) {
 	then_telemetry_row_matches(current_scenario(loc), segment_idx, batch_idx, row_idx, expected_kind, expected_status, expected_scope, expected_name, expected_span_id, expected_parent_id, expected_attr_i64, expected_value_f64, loc)
+}
+
+then_multi_recorder_same_thread_spans_are_isolated_ambient :: #force_inline proc(expected_rec_a_rows: int, expected_rec_b_rows: int, loc := #caller_location) {
+	then_multi_recorder_same_thread_spans_are_isolated(current_scenario(loc), expected_rec_a_rows, expected_rec_b_rows, loc)
 }
 
 then_multithreaded_span_trees_are_isolated_ambient :: #force_inline proc(expected_total_rows: int, expected_unique_spans: int, expected_root_spans: int, expected_min_threads: int, loc := #caller_location) {
@@ -307,7 +372,31 @@ then_ast_enforces_four_layer_atdd_contract_ambient :: #force_inline proc(tests_d
 	then_ast_enforces_four_layer_atdd_contract(current_scenario(loc), tests_dir, sut_dir, loc)
 }
 
-then_ast_detects_layer_violations_in_synthetic_spec_ambient :: #force_inline proc(synthetic_spec_src: string, synthetic_dsl_src: string, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location) {
-	then_ast_detects_layer_violations_in_synthetic_spec(current_scenario(loc), synthetic_spec_src, synthetic_dsl_src, expected_sut_calls, expected_testing_calls, expected_zero_arg_steps, expected_driver_leaks, expected_forbidden_imps, expected_do_statements, loc)
+then_ast_detects_layer_violations_in_synthetic_spec_ambient :: #force_inline proc(synthetic_spec_src: string, synthetic_dsl_src: string, expected_non_test_procs: int, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location) {
+	then_ast_detects_layer_violations_in_synthetic_spec(current_scenario(loc), synthetic_spec_src, synthetic_dsl_src, expected_non_test_procs, expected_sut_calls, expected_testing_calls, expected_zero_arg_steps, expected_driver_leaks, expected_forbidden_imps, expected_do_statements, loc)
+}
+
+then_ast_analyzes_telemetry_call_sites_ambient :: #force_inline proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location) {
+	then_ast_analyzes_telemetry_call_sites(current_scenario(loc), instrumented_src, expected_total_calls, expected_unique_scopes, expected_unique_names, expected_dynamic_hazards, expected_misplaced_spans, loc)
+}
+
+then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist_ambient :: #force_inline proc(thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location) {
+	then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist(current_scenario(loc), thread_count, iterations_per_thread, expected_total_rows, loc)
+}
+
+upon_running_blocking_producer_woken_by_disable_ambient :: #force_inline proc(total_events: int, loc := #caller_location) {
+	upon_running_blocking_producer_woken_by_disable(current_scenario(loc), total_events, loc)
+}
+
+then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly_ambient :: #force_inline proc(expected_flushed_batches: int, loc := #caller_location) {
+	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly(current_scenario(loc), expected_flushed_batches, loc)
+}
+
+then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema_ambient :: #force_inline proc(expected_custom_schema_cols: int, loc := #caller_location) {
+	then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema(current_scenario(loc), expected_custom_schema_cols, loc)
+}
+
+then_live_flushes_complete_under_continuous_producer_load_ambient :: #force_inline proc(producer_count: int, flush_calls: int, loc := #caller_location) {
+	then_live_flushes_complete_under_continuous_producer_load(current_scenario(loc), producer_count, flush_calls, loc)
 }
 

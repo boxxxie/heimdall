@@ -25,11 +25,11 @@ import "core:strings"
 //      `Upon_DSL`, `Then_DSL`) and `<step>_ambient` procedures preserving
 //      `#caller_location` and default parameter values
 // 3. Static AST Purity Linter (`analyze_atdd_sources` / `analyze_atdd_directories`):
-//    - Rejects forbidden `OdinArrow` imports in Layer 1 (`spec_*.odin`)
-//    - Rejects direct `heimdall.*` or `driver_*` calls in Layer 1 `@(scenario)` procs
-//    - Rejects raw `testing.expect*` calls in Layer 1 `@(scenario)` procs
+//    - Rejects forbidden `OdinArrow`, `sleipnir`, and `heimdall` imports in Layer 1 (`spec_*.odin`)
+//    - Rejects non-`@(test)` procedures and direct `heimdall.*` or `driver_*` calls in Layer 1
+//    - Rejects raw `testing.expect*` calls in Layer 1 `@(test)` scenario procs
 //    - Rejects zero-argument "Macro Theater" `upon` / `then` steps in Layer 1 & Layer 2
-//    - Rejects direct `s.*` driver field accesses in Layer 1 `@(scenario)` procs
+//    - Rejects direct `s.*` driver field accesses in Layer 1 `@(test)` scenario procs
 //    - Rejects `do` statements (`ast.Block_Stmt.uses_do`) across `tests/` and `heimdall/`
 //    - Verifies 100% of defined Layer 2 DSL steps are exercised by Layer 1 specs
 // =============================================================================
@@ -80,17 +80,19 @@ ATDD_Module :: struct {
 }
 
 AST_Contract_Report :: struct {
-	parsed_files:          int,
-	spec_procs_checked:    int,
-	dsl_steps_defined:     int,
-	dsl_steps_called:      int,
-	unused_dsl_procedures: int,
-	direct_sut_calls:      int,
-	raw_testing_calls:     int,
-	zero_arg_mega_steps:   int,
-	driver_field_leaks:    int,
-	forbidden_imports:     int,
-	do_statements:         int,
+	parsed_files:           int,
+	spec_procs_checked:     int,
+	non_test_procs_in_spec: int,
+	dsl_steps_defined:      int,
+	dsl_steps_called:       int,
+	unused_dsl_procedures:  int,
+	unknown_dsl_calls:      int,
+	direct_sut_calls:       int,
+	raw_testing_calls:      int,
+	zero_arg_mega_steps:    int,
+	driver_field_leaks:     int,
+	forbidden_imports:      int,
+	do_statements:          int,
 }
 
 @(private)
@@ -219,29 +221,27 @@ is_dsl_step_name :: proc(name: string) -> bool {
 }
 
 @(private)
-parse_atdd_dsl_source :: proc(
-	src: string,
-	filename: string,
-	mod: ^ATDD_Module,
-	diags: ^[dynamic]Codegen_Diagnostic,
-) -> bool {
-	arena_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
+parse_odin_source_into_ast :: proc(
+	src:       string,
+	filename:  string,
+	allocator: mem.Allocator,
+) -> (file: ^ast.File, ok: bool) {
 	p := parser.default_parser()
-	file: ^ast.File
-	parse_ok := false
-	{
-		context.allocator = arena_alloc
-		file = ast.new(ast.File, tokenizer.Pos{}, tokenizer.Pos{})
-		file.src      = src
-		file.fullpath = filename
-		parse_ok = parser.parse_file(&p, file) && p.error_count == 0
-	}
-	if !parse_ok {
-		msg := fmt.tprintf("failed to parse ATDD DSL file (%d syntax errors)", p.error_count)
-		append_diagnostic(diags, filename, 1, 1, msg)
-		return false
-	}
+	prev_alloc := context.allocator
+	context.allocator = allocator
+	defer context.allocator = prev_alloc
 
+	file = ast.new(ast.File, tokenizer.Pos{}, tokenizer.Pos{})
+	file.src      = src
+	file.fullpath = filename
+	ok = parser.parse_file(&p, file) && p.error_count == 0
+	return file, ok
+}
+
+@(private)
+populate_atdd_module_from_dsl_ast :: proc(file: ^ast.File, mod: ^ATDD_Module) {
+	src := file.src
+	arena_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
 	if len(mod.package_name) == 0 && file.pkg_name != "" {
 		mod.package_name = file.pkg_name
 	}
@@ -300,7 +300,7 @@ parse_atdd_dsl_source :: proc(
 					if strings.has_prefix(raw_res, "(") {
 						ret_type = raw_res
 					} else {
-						ret_type = fmt.tprintf("(%s)", raw_res)
+						ret_type = fmt.aprintf("(%s)", raw_res, allocator = arena_alloc)
 					}
 				}
 			}
@@ -323,13 +323,14 @@ parse_atdd_dsl_source :: proc(
 				}
 				is_var := is_ell || (.Ellipsis in field.flags) || strings.has_prefix(type_str, "..")
 				if is_var && !strings.has_prefix(type_str, "..") {
-					type_str = fmt.tprintf("..%s", type_str)
+					type_str = fmt.aprintf("..%s", type_str, allocator = arena_alloc)
 				}
 				is_poly := strings.contains(type_str, "$")
 				is_loc  := def_str == "#caller_location"
 
 				for name_expr in field.names {
-					p_name := node_source(src, name_expr)
+					p_name    := node_source(src, name_expr)
+					p_is_poly := is_poly || strings.contains(p_name, "$")
 					if is_loc {
 						step.has_loc   = true
 						step.loc_param = p_name
@@ -339,7 +340,7 @@ parse_atdd_dsl_source :: proc(
 						type_expr     = type_str,
 						default_expr  = def_str,
 						is_variadic   = is_var,
-						is_poly_type  = is_poly,
+						is_poly_type  = p_is_poly,
 						is_caller_loc = is_loc,
 					})
 				}
@@ -348,27 +349,42 @@ parse_atdd_dsl_source :: proc(
 			append(&mod.steps, step)
 		}
 	}
+}
 
-	return true
+@(private)
+parse_atdd_dsl_source :: proc(
+	src:      string,
+	filename: string,
+	mod:      ^ATDD_Module,
+	diags:    ^[dynamic]Codegen_Diagnostic,
+) -> (file: ^ast.File, ok: bool) {
+	arena_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
+	file, ok = parse_odin_source_into_ast(src, filename, arena_alloc)
+	if !ok {
+		append_diagnostic(diags, filename, 1, 1, "failed to parse ATDD DSL file")
+		return nil, false
+	}
+	populate_atdd_module_from_dsl_ast(file, mod)
+	return file, true
 }
 
 // =============================================================================
-// Layer 1 `@(scenario)` AST Purity Validator & 4-Layer Contract Analyzer
+// Layer 1 `@(test)` Scenario AST Purity Validator & 4-Layer Contract Analyzer
 // =============================================================================
 
-validate_atdd_scenario_source :: proc(
-	src: string,
+@(private)
+validate_spec_report :: proc(
+	report:   AST_Contract_Report,
 	filename: string,
-	diags: ^[dynamic]Codegen_Diagnostic,
+	diags:    ^[dynamic]Codegen_Diagnostic,
 ) -> bool {
-	report, ok := analyze_atdd_sources({src}, "", nil, context.temp_allocator)
-	if !ok {
-		append_diagnostic(diags, filename, 1, 1, "failed to parse ATDD spec file")
-		return false
-	}
 	valid := true
 	if report.forbidden_imports > 0 {
 		append_diagnostic(diags, filename, 1, 1, "forbidden Layer 3/4 import in Layer 1 spec file")
+		valid = false
+	}
+	if report.non_test_procs_in_spec > 0 {
+		append_diagnostic(diags, filename, 1, 1, "non-@(test) helper procedure in Layer 1 spec file")
 		valid = false
 	}
 	if report.direct_sut_calls > 0 {
@@ -391,22 +407,24 @@ validate_atdd_scenario_source :: proc(
 		append_diagnostic(diags, filename, 1, 1, "disallowed `do` statement in Layer 1 spec file")
 		valid = false
 	}
+	if report.unknown_dsl_calls > 0 {
+		append_diagnostic(diags, filename, 1, 1, "Layer 1 spec calls an undefined Layer 2 DSL step")
+		valid = false
+	}
 	return valid
 }
 
-@(private)
-parse_odin_source_into_ast :: proc(
-	src:       string,
-	filename:  string,
-	allocator: mem.Allocator,
-) -> (file: ^ast.File, ok: bool) {
-	p := parser.default_parser()
-	context.allocator = allocator
-	file = ast.new(ast.File, tokenizer.Pos{}, tokenizer.Pos{})
-	file.src      = src
-	file.fullpath = filename
-	ok = parser.parse_file(&p, file) && p.error_count == 0
-	return file, ok
+validate_atdd_scenario_source :: proc(
+	src:      string,
+	filename: string,
+	diags:    ^[dynamic]Codegen_Diagnostic,
+) -> bool {
+	report, ok := analyze_atdd_sources({src}, "", nil, context.temp_allocator)
+	if !ok {
+		append_diagnostic(diags, filename, 1, 1, "failed to parse ATDD spec file")
+		return false
+	}
+	return validate_spec_report(report, filename, diags)
 }
 
 @(private)
@@ -446,6 +464,66 @@ AST_Walk_Context :: struct {
 }
 
 @(private)
+record_called_dsl_step :: proc(called: ^map[string]bool, canonical: string) {
+	if called == nil {
+		return
+	}
+	if canonical in called^ {
+		return
+	}
+	key := strings.clone(canonical, called.allocator)
+	called^[key] = true
+}
+
+@(private)
+is_scenario_ctx_arg :: proc(expr: ^ast.Expr, scenario_var_name: string) -> bool {
+	if expr == nil {
+		return false
+	}
+	target := expr
+	if fv, is_fv := expr.derived.(^ast.Field_Value); is_fv {
+		target = fv.value
+	}
+	#partial switch e in target.derived {
+	case ^ast.Ident:
+		return e.name == "s" || (len(scenario_var_name) > 0 && e.name == scenario_var_name)
+	case ^ast.Call_Expr:
+		if fn_id, ok := e.expr.derived.(^ast.Ident); ok {
+			return fn_id.name == "current_scenario"
+		}
+	}
+	return false
+}
+
+@(private)
+is_caller_loc_call_arg :: proc(expr: ^ast.Expr) -> bool {
+	if expr == nil {
+		return false
+	}
+	if fv, is_fv := expr.derived.(^ast.Field_Value); is_fv {
+		if id, ok := fv.field.derived.(^ast.Ident); ok && id.name == "loc" {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+count_domain_call_args :: proc(args: []^ast.Expr, scenario_var_name: string, strip_ctx: bool) -> int {
+	count := 0
+	for arg, idx in args {
+		if is_caller_loc_call_arg(arg) {
+			continue
+		}
+		if strip_ctx && idx == 0 && is_scenario_ctx_arg(arg, scenario_var_name) {
+			continue
+		}
+		count += 1
+	}
+	return count
+}
+
+@(private)
 ast_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
 	if node == nil {
 		return nil
@@ -453,7 +531,7 @@ ast_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
 	ctx := (^AST_Walk_Context)(visitor.data)
 	#partial switch n in node.derived {
 	case ^ast.Block_Stmt:
-		if !ctx.in_spec_proc && n.uses_do {
+		if n.uses_do {
 			ctx.report.do_statements += 1
 		}
 	case ^ast.Value_Decl:
@@ -481,14 +559,15 @@ ast_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
 			#partial switch fn in n.expr.derived {
 			case ^ast.Ident:
 				if is_dsl_step_name(fn.name) {
+					is_ambient := strings.has_suffix(fn.name, "_ambient")
 					canonical := strings.trim_suffix(fn.name, "_ambient")
 					canonical = strings.trim_suffix(canonical, "_ctx")
-					if ctx.called != nil {
-						ctx.called[canonical] = true
-					}
+					record_called_dsl_step(ctx.called, canonical)
 					ctx.report.dsl_steps_called += 1
-					if (strings.has_prefix(canonical, "upon_") || strings.has_prefix(canonical, "then_")) && len(n.args) < 2 {
-						ctx.report.zero_arg_mega_steps += 1
+					if strings.has_prefix(canonical, "upon_") || strings.has_prefix(canonical, "then_") {
+						if count_domain_call_args(n.args, ctx.scenario_var_name, !is_ambient) == 0 {
+							ctx.report.zero_arg_mega_steps += 1
+						}
 					}
 				} else if !is_allowed_spec_ident_call(fn.name) {
 					ctx.report.direct_sut_calls += 1
@@ -498,40 +577,35 @@ ast_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
 					field_name := fn.field.name
 					switch recv_ident.name {
 					case "given", "upon", "then":
-						canonical := fmt.tprintf("%s_%s", recv_ident.name, field_name)
-						if ctx.called != nil {
-							ctx.called[canonical] = true
-						}
+						buf: [256]byte
+						canonical := fmt.bprintf(buf[:], "%s_%s", recv_ident.name, field_name)
+						record_called_dsl_step(ctx.called, canonical)
 						ctx.report.dsl_steps_called += 1
-						if (recv_ident.name == "upon" || recv_ident.name == "then") && len(n.args) == 0 {
+						if (recv_ident.name == "upon" || recv_ident.name == "then") && count_domain_call_args(n.args, ctx.scenario_var_name, false) == 0 {
 							ctx.report.zero_arg_mega_steps += 1
-						}
-					case "heimdall", "oa":
-						if len(field_name) > 0 && field_name[0] >= 'a' && field_name[0] <= 'z' {
-							ctx.report.direct_sut_calls += 1
 						}
 					case "testing":
 						ctx.report.raw_testing_calls += 1
 					case:
 						if fn.op.kind == .Arrow_Right && is_dsl_step_name(field_name) {
-							if ctx.called != nil {
-								ctx.called[field_name] = true
-							}
+							record_called_dsl_step(ctx.called, field_name)
 							ctx.report.dsl_steps_called += 1
-							if (strings.has_prefix(field_name, "upon_") || strings.has_prefix(field_name, "then_")) && len(n.args) == 0 {
+							if (strings.has_prefix(field_name, "upon_") || strings.has_prefix(field_name, "then_")) && count_domain_call_args(n.args, ctx.scenario_var_name, false) == 0 {
 								ctx.report.zero_arg_mega_steps += 1
 							}
+						} else if len(field_name) > 0 && field_name[0] >= 'a' && field_name[0] <= 'z' {
+							ctx.report.direct_sut_calls += 1
 						}
 					}
+				} else if len(fn.field.name) > 0 && fn.field.name[0] >= 'a' && fn.field.name[0] <= 'z' {
+					ctx.report.direct_sut_calls += 1
 				}
 			}
 		}
 	case ^ast.Selector_Expr:
 		if ctx.in_spec_proc && n.op.kind != .Arrow_Right {
-			if recv, ok := n.expr.derived.(^ast.Ident); ok {
-				if recv.name == "s" || (len(ctx.scenario_var_name) > 0 && recv.name == ctx.scenario_var_name) {
-					ctx.report.driver_field_leaks += 1
-				}
+			if is_scenario_ctx_arg(n.expr, ctx.scenario_var_name) {
+				ctx.report.driver_field_leaks += 1
 			}
 		}
 	}
@@ -557,28 +631,13 @@ analyze_spec_ast :: proc(
 	report: ^AST_Contract_Report,
 	called: ^map[string]bool,
 ) {
-	count_do_statements_in_file(file, report)
-
 	for decl_stmt in file.decls {
 		#partial switch d in decl_stmt.derived {
 		case ^ast.Import_Decl:
-			if strings.contains(d.fullpath, "OdinArrow") || strings.contains(d.fullpath, "sleipnir") {
+			if unquote_ast_string(d.fullpath) != "core:testing" {
 				report.forbidden_imports += 1
 			}
 		case ^ast.Value_Decl:
-			if len(d.values) == 0 {
-				continue
-			}
-			proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
-			if !is_proc || proc_lit.body == nil {
-				continue
-			}
-			_, _, has_test := get_decl_attribute(d, "test")
-			if !has_test {
-				report.direct_sut_calls += 1
-			} else {
-				report.spec_procs_checked += 1
-			}
 			walk_ctx := AST_Walk_Context{
 				report            = report,
 				called            = called,
@@ -589,9 +648,131 @@ analyze_spec_ast :: proc(
 				visit = ast_visit_node,
 				data  = &walk_ctx,
 			}
+			if len(d.values) == 0 {
+				report.non_test_procs_in_spec += 1
+				ast.walk(&v, decl_stmt)
+				continue
+			}
+			proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
+			if !is_proc || proc_lit.body == nil {
+				report.non_test_procs_in_spec += 1
+				ast.walk(&v, decl_stmt)
+				continue
+			}
+			_, _, has_test := get_decl_attribute(d, "test")
+			if !has_test {
+				report.non_test_procs_in_spec += 1
+			} else {
+				report.spec_procs_checked += 1
+			}
 			ast.walk(&v, proc_lit.body)
 		}
 	}
+}
+
+@(private)
+analyze_atdd_parsed_files :: proc(
+	dsl_files:   []^ast.File,
+	spec_files:  []^ast.File,
+	extra_files: []^ast.File,
+	allocator := context.temp_allocator,
+	mod: ^ATDD_Module = nil,
+) -> AST_Contract_Report {
+	report: AST_Contract_Report
+	called_steps  := make(map[string]bool, 64, allocator)
+	defined_steps := make([dynamic]string, 0, 64, allocator)
+	defined_set   := make(map[string]bool, 64, allocator)
+	defer {
+		for k in called_steps {
+			delete(k, allocator)
+		}
+		delete(called_steps)
+		delete(defined_steps)
+		delete(defined_set)
+	}
+
+	for dsl_file in dsl_files {
+		if dsl_file == nil {
+			continue
+		}
+		report.parsed_files += 1
+		count_do_statements_in_file(dsl_file, &report)
+		if mod == nil {
+			for decl_stmt in dsl_file.decls {
+				if vd, is_vd := decl_stmt.derived.(^ast.Value_Decl); is_vd && !vd.is_mutable && len(vd.names) > 0 && len(vd.values) > 0 {
+					ident, is_id := vd.names[0].derived.(^ast.Ident)
+					if !is_id {
+						continue
+					}
+					#partial switch val_node in vd.values[0].derived {
+					case ^ast.Proc_Lit:
+						if is_dsl_step_name(ident.name) {
+							canonical := strings.trim_suffix(ident.name, "_ctx")
+							append(&defined_steps, canonical)
+							defined_set[canonical] = true
+							report.dsl_steps_defined += 1
+							if (strings.has_prefix(canonical, "upon_") || strings.has_prefix(canonical, "then_")) &&
+								count_non_loc_proc_params(dsl_file.src, val_node) < 2 {
+								report.zero_arg_mega_steps += 1
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if mod != nil {
+		for st in mod.steps {
+			append(&defined_steps, st.proc_name)
+			defined_set[st.proc_name] = true
+			report.dsl_steps_defined += 1
+			if len(dsl_files) > 0 {
+				non_loc_params := 0
+				for p in st.params {
+					if !p.is_caller_loc {
+						non_loc_params += 1
+					}
+				}
+				if (strings.has_prefix(st.proc_name, "upon_") || strings.has_prefix(st.proc_name, "then_")) &&
+					non_loc_params == 0 {
+					report.zero_arg_mega_steps += 1
+				}
+			}
+		}
+	}
+
+	for spec_file in spec_files {
+		if spec_file == nil {
+			continue
+		}
+		report.parsed_files += 1
+		analyze_spec_ast(spec_file, &report, &called_steps)
+	}
+
+	for extra_file in extra_files {
+		if extra_file == nil {
+			continue
+		}
+		report.parsed_files += 1
+		count_do_statements_in_file(extra_file, &report)
+	}
+
+	for step_name in defined_steps {
+		if !called_steps[step_name] {
+			report.unused_dsl_procedures += 1
+		}
+	}
+
+	if len(defined_steps) > 0 {
+		for called_name in called_steps {
+			if !defined_set[called_name] {
+				report.unknown_dsl_calls += 1
+			}
+		}
+	}
+
+	return report
 }
 
 analyze_atdd_sources :: proc(
@@ -605,36 +786,21 @@ analyze_atdd_sources :: proc(
 	defer mem.dynamic_arena_destroy(&arena)
 	ast_alloc := mem.dynamic_arena_allocator(&arena)
 
-	called_steps  := make(map[string]bool, 64, allocator)
-	defined_steps := make([dynamic]string, 0, 64, allocator)
+	dsl_files   := make([dynamic]^ast.File, 0, 1, allocator)
+	spec_files  := make([dynamic]^ast.File, 0, len(spec_sources), allocator)
+	extra_files := make([dynamic]^ast.File, 0, len(extra_sources), allocator)
+	defer {
+		delete(dsl_files)
+		delete(spec_files)
+		delete(extra_files)
+	}
 
 	if len(dsl_source) > 0 {
 		dsl_file, dsl_ok := parse_odin_source_into_ast(dsl_source, "dsl_heimdall.odin", ast_alloc)
 		if !dsl_ok {
 			return {}, false
 		}
-		report.parsed_files += 1
-		count_do_statements_in_file(dsl_file, &report)
-		for decl_stmt in dsl_file.decls {
-			if vd, is_vd := decl_stmt.derived.(^ast.Value_Decl); is_vd && !vd.is_mutable && len(vd.names) > 0 && len(vd.values) > 0 {
-				ident, is_id := vd.names[0].derived.(^ast.Ident)
-				if !is_id {
-					continue
-				}
-				#partial switch val_node in vd.values[0].derived {
-				case ^ast.Proc_Lit:
-					if is_dsl_step_name(ident.name) {
-						canonical := strings.trim_suffix(ident.name, "_ctx")
-						append(&defined_steps, canonical)
-						report.dsl_steps_defined += 1
-						if (strings.has_prefix(canonical, "upon_") || strings.has_prefix(canonical, "then_")) &&
-							count_non_loc_proc_params(dsl_source, val_node) < 2 {
-							report.zero_arg_mega_steps += 1
-						}
-					}
-				}
-			}
-		}
+		append(&dsl_files, dsl_file)
 	}
 
 	for src in spec_sources {
@@ -642,8 +808,7 @@ analyze_atdd_sources :: proc(
 		if !s_ok {
 			return {}, false
 		}
-		report.parsed_files += 1
-		analyze_spec_ast(spec_file, &report, &called_steps)
+		append(&spec_files, spec_file)
 	}
 
 	for src in extra_sources {
@@ -651,17 +816,10 @@ analyze_atdd_sources :: proc(
 		if !e_ok {
 			return {}, false
 		}
-		report.parsed_files += 1
-		count_do_statements_in_file(extra_file, &report)
+		append(&extra_files, extra_file)
 	}
 
-	for step_name in defined_steps {
-		if !called_steps[step_name] {
-			report.unused_dsl_procedures += 1
-		}
-	}
-
-	return report, true
+	return analyze_atdd_parsed_files(dsl_files[:], spec_files[:], extra_files[:], allocator), true
 }
 
 analyze_atdd_directories :: proc(
@@ -681,10 +839,33 @@ analyze_atdd_directories :: proc(
 	}
 	defer os.file_info_slice_delete(s_entries, allocator)
 
-	spec_srcs  := make([dynamic]string, 0, 8, allocator)
-	extra_srcs := make([dynamic]string, 0, 8, allocator)
-	dsl_src    := ""
-	gen_src    := ""
+	slice.sort_by(t_entries, proc(a, b: os.File_Info) -> bool { return a.name < b.name })
+	slice.sort_by(s_entries, proc(a, b: os.File_Info) -> bool { return a.name < b.name })
+
+	mod: ATDD_Module
+	init_atdd_module(&mod)
+	defer destroy_atdd_module(&mod)
+	ast_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
+
+	dsl_files    := make([dynamic]^ast.File, 0, 2, allocator)
+	spec_files   := make([dynamic]^ast.File, 0, 8, allocator)
+	extra_files  := make([dynamic]^ast.File, 0, 8, allocator)
+	file_buffers := make([dynamic][]byte, 0, 16, allocator)
+	defer {
+		for buf in file_buffers {
+			delete(buf, allocator)
+		}
+		delete(file_buffers)
+		delete(dsl_files)
+		delete(spec_files)
+		delete(extra_files)
+	}
+	schema_spec: Telemetry_Schema_Spec
+	init_telemetry_schema_spec(&schema_spec)
+	defer destroy_telemetry_schema_spec(&schema_spec)
+
+	gen_src        := ""
+	schema_gen_src := ""
 
 	for entry in t_entries {
 		if entry.type != .Regular || !strings.has_suffix(entry.name, ".odin") {
@@ -694,16 +875,22 @@ analyze_atdd_directories :: proc(
 		if r_err != nil {
 			return {}, false, false
 		}
+		append(&file_buffers, raw)
 		src := string(raw)
+		parsed, p_ok := parse_odin_source_into_ast(src, entry.fullpath, ast_alloc)
+		if !p_ok {
+			return {}, false, false
+		}
 		if entry.name == "dsl_atdd_gen.odin" {
 			gen_src = src
-			append(&extra_srcs, src)
+			append(&extra_files, parsed)
 		} else if strings.has_prefix(entry.name, "dsl_") {
-			dsl_src = src
+			append(&dsl_files, parsed)
+			populate_atdd_module_from_dsl_ast(parsed, &mod)
 		} else if strings.has_prefix(entry.name, "spec_") {
-			append(&spec_srcs, src)
+			append(&spec_files, parsed)
 		} else {
-			append(&extra_srcs, src)
+			append(&extra_files, parsed)
 		}
 	}
 
@@ -715,16 +902,26 @@ analyze_atdd_directories :: proc(
 		if r_err != nil {
 			return {}, false, false
 		}
-		append(&extra_srcs, string(raw))
+		append(&file_buffers, raw)
+		src := string(raw)
+		parsed, p_ok := parse_odin_source_into_ast(src, entry.fullpath, ast_alloc)
+		if !p_ok {
+			return {}, false, false
+		}
+		if entry.name == "schema_gen.odin" {
+			schema_gen_src = src
+		} else {
+			populate_telemetry_schema_from_ast(parsed, &schema_spec, allocator)
+		}
+		append(&extra_files, parsed)
 	}
 
-	report, ok = analyze_atdd_sources(spec_srcs[:], dsl_src, extra_srcs[:], allocator)
-	if !ok {
-		return {}, false, false
-	}
-
-	expected_gen, gen_ok := generate_atdd_from_sources({dsl_src}, {"dsl_heimdall.odin"}, spec_srcs[:], nil, nil, allocator)
-	codegen_matches = gen_ok && len(gen_src) > 0 && expected_gen == gen_src
+	report = analyze_atdd_parsed_files(dsl_files[:], spec_files[:], extra_files[:], allocator, &mod)
+	expected_gen := emit_atdd_module_code(&mod, allocator)
+	defer delete(expected_gen, allocator)
+	expected_schema_gen := emit_telemetry_schema_code(&schema_spec, allocator)
+	defer delete(expected_schema_gen, allocator)
+	codegen_matches = len(gen_src) > 0 && expected_gen == gen_src && len(schema_gen_src) > 0 && expected_schema_gen == schema_gen_src
 	return report, codegen_matches, true
 }
 
@@ -733,17 +930,46 @@ analyze_atdd_directories :: proc(
 // =============================================================================
 
 @(private)
+is_ident_char :: proc(b: byte) -> bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+@(private)
+contains_qualified_ident_prefix :: proc(s, prefix: string) -> bool {
+	if len(prefix) == 0 || len(s) < len(prefix) {
+		return false
+	}
+	rem := s
+	offset := 0
+	for len(rem) >= len(prefix) {
+		idx := strings.index(rem, prefix)
+		if idx < 0 {
+			return false
+		}
+		abs_idx := offset + idx
+		if abs_idx == 0 || !is_ident_char(s[abs_idx - 1]) {
+			return true
+		}
+		step := idx + 1
+		rem = rem[step:]
+		offset += step
+	}
+	return false
+}
+
+@(private)
 is_atdd_import_used :: proc(mod: ^ATDD_Module, alias: string) -> bool {
 	if alias == "testing" {
 		return true
 	}
-	prefix := fmt.tprintf("%s.", alias)
+	buf: [128]byte
+	prefix := fmt.bprintf(buf[:], "%s.", alias)
 	for st in mod.steps {
-		if strings.contains(st.return_type, prefix) {
+		if contains_qualified_ident_prefix(st.return_type, prefix) {
 			return true
 		}
 		for p in st.params {
-			if strings.contains(p.type_expr, prefix) || strings.contains(p.default_expr, prefix) {
+			if contains_qualified_ident_prefix(p.type_expr, prefix) || contains_qualified_ident_prefix(p.default_expr, prefix) {
 				return true
 			}
 		}
@@ -775,6 +1001,10 @@ step_has_poly_params :: proc(st: ATDD_Step_Spec) -> bool {
 @(private)
 emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator) -> string {
 	sb := strings.builder_make(allocator)
+	sig_b := strings.builder_make(allocator)
+	call_b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&sig_b)
+	defer strings.builder_destroy(&call_b)
 	pkg := mod.package_name if len(mod.package_name) > 0 else "heimdall_tests"
 
 	fmt.sbprintln(&sb, "// Code generated by heimdall_gen (`core:odin/parser`) ATDD DSL generator. DO NOT EDIT.")
@@ -819,6 +1049,7 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "@(deferred_out = scenario_scope_end)")
 	fmt.sbprintln(&sb, "scenario :: proc(t: ^testing.T, loc := #caller_location) -> Scenario_Handle {")
+	fmt.sbprintln(&sb, "\tassert(_active_scenario_ctx == nil, \"Active ATDD scenario already running in this scope; wrap sequential scenarios in { } blocks\", loc)")
 	fmt.sbprintln(&sb, "\tassert(_scenario_depth < MAX_SCENARIO_DEPTH, \"MAX_SCENARIO_DEPTH exceeded; wrap sequential scenarios in { } blocks\", loc)")
 	fmt.sbprintln(&sb, "\ts := &_scenario_stack[_scenario_depth]")
 	fmt.sbprintln(&sb, "\t_scenario_depth += 1")
@@ -845,7 +1076,7 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 		if step_has_poly_params(st) {
 			continue
 		}
-		sig_b := strings.builder_make(context.temp_allocator)
+		strings.builder_reset(&sig_b)
 		for p in st.params {
 			fmt.sbprint(&sig_b, ", ")
 			format_atdd_param(&sig_b, p)
@@ -882,7 +1113,7 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 				continue
 			}
 			short := strings.trim_prefix(st.proc_name, grp.pfx)
-			sig_b := strings.builder_make(context.temp_allocator)
+			strings.builder_reset(&sig_b)
 			for p, idx in st.params {
 				if idx > 0 {
 					fmt.sbprint(&sig_b, ", ")
@@ -916,11 +1147,12 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 	fmt.sbprintln(&sb)
 
 	for st in mod.steps {
-		amb_name := fmt.tprintf("%s_ambient", st.proc_name)
+		amb_buf: [256]byte
+		amb_name := fmt.bprintf(amb_buf[:], "%s_ambient", st.proc_name)
 		ctx_name := st.impl_name
 
-		sig_b  := strings.builder_make(context.temp_allocator)
-		call_b := strings.builder_make(context.temp_allocator)
+		strings.builder_reset(&sig_b)
+		strings.builder_reset(&call_b)
 
 		seen_variadic := false
 		for p, idx in st.params {
@@ -930,19 +1162,21 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 			format_atdd_param(&sig_b, p)
 
 			fmt.sbprint(&call_b, ", ")
+			call_name := strings.trim_prefix(p.name, "$")
 			if p.is_variadic {
 				seen_variadic = true
-				fmt.sbprintf(&call_b, "..%s", p.name)
+				fmt.sbprintf(&call_b, "..%s", call_name)
 			} else if seen_variadic {
-				fmt.sbprintf(&call_b, "%s = %s", p.name, p.name)
+				fmt.sbprintf(&call_b, "%s = %s", call_name, call_name)
 			} else {
-				fmt.sbprintf(&call_b, "%s", p.name)
+				fmt.sbprintf(&call_b, "%s", call_name)
 			}
 		}
 
+		ctx_buf: [128]byte
 		ctx_expr := "current_scenario()"
 		if st.has_loc && len(st.loc_param) > 0 {
-			ctx_expr = fmt.tprintf("current_scenario(%s)", st.loc_param)
+			ctx_expr = fmt.bprintf(ctx_buf[:], "current_scenario(%s)", st.loc_param)
 		}
 
 		if len(st.return_type) > 0 {
@@ -967,28 +1201,37 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 }
 
 generate_atdd_from_sources :: proc(
-	dsl_sources: []string,
-	dsl_filenames: []string = nil,
-	spec_sources: []string = nil,
+	dsl_sources:    []string,
+	dsl_filenames:  []string = nil,
+	spec_sources:   []string = nil,
 	spec_filenames: []string = nil,
-	diagnostics: ^[dynamic]Codegen_Diagnostic = nil,
+	diagnostics:    ^[dynamic]Codegen_Diagnostic = nil,
 	allocator := context.allocator,
 ) -> (code: string, ok: bool) {
 	mod: ATDD_Module
 	init_atdd_module(&mod)
 	defer destroy_atdd_module(&mod)
+	ast_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
 
 	all_ok := true
 	for src, idx in dsl_sources {
 		fname := dsl_filenames[idx] if idx < len(dsl_filenames) else "dsl.odin"
-		if !parse_atdd_dsl_source(src, fname, &mod, diagnostics) {
+		if _, p_ok := parse_atdd_dsl_source(src, fname, &mod, diagnostics); !p_ok {
 			all_ok = false
 		}
 	}
 
 	for src, idx in spec_sources {
 		fname := spec_filenames[idx] if idx < len(spec_filenames) else "spec.odin"
-		if !validate_atdd_scenario_source(src, fname, diagnostics) {
+		spec_file, s_ok := parse_odin_source_into_ast(src, fname, ast_alloc)
+		if !s_ok {
+			append_diagnostic(diagnostics, fname, 1, 1, "failed to parse ATDD spec file")
+			all_ok = false
+			continue
+		}
+		spec_mod := &mod if len(mod.steps) > 0 else nil
+		report := analyze_atdd_parsed_files(nil, {spec_file}, nil, context.temp_allocator, spec_mod)
+		if !validate_spec_report(report, fname, diagnostics) {
 			all_ok = false
 		}
 	}
@@ -1000,9 +1243,9 @@ generate_atdd_from_sources :: proc(
 }
 
 generate_atdd_directory :: proc(
-	dir_path: string,
+	dir_path:     string,
 	out_filename: string = "dsl_atdd_gen.odin",
-	diagnostics: ^[dynamic]Codegen_Diagnostic = nil,
+	diagnostics:  ^[dynamic]Codegen_Diagnostic = nil,
 	allocator := context.allocator,
 ) -> (out_path: string, ok: bool) {
 	entries, rerr := os.read_all_directory_by_path(dir_path, context.allocator)
@@ -1033,6 +1276,7 @@ generate_atdd_directory :: proc(
 	mod: ATDD_Module
 	init_atdd_module(&mod)
 	defer destroy_atdd_module(&mod)
+	ast_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
 
 	file_buffers := make([dynamic][]byte)
 	defer {
@@ -1051,7 +1295,7 @@ generate_atdd_directory :: proc(
 			return "", false
 		}
 		append(&file_buffers, data)
-		if !parse_atdd_dsl_source(string(data), full, &mod, diagnostics) {
+		if _, p_ok := parse_atdd_dsl_source(string(data), full, &mod, diagnostics); !p_ok {
 			all_ok = false
 		}
 	}
@@ -1064,7 +1308,15 @@ generate_atdd_directory :: proc(
 			return "", false
 		}
 		append(&file_buffers, data)
-		if !validate_atdd_scenario_source(string(data), full, diagnostics) {
+		spec_file, s_ok := parse_odin_source_into_ast(string(data), full, ast_alloc)
+		if !s_ok {
+			append_diagnostic(diagnostics, full, 1, 1, "failed to parse ATDD spec file")
+			all_ok = false
+			continue
+		}
+		spec_mod := &mod if len(mod.steps) > 0 else nil
+		report := analyze_atdd_parsed_files(nil, {spec_file}, nil, context.temp_allocator, spec_mod)
+		if !validate_spec_report(report, full, diagnostics) {
 			all_ok = false
 		}
 	}

@@ -7,7 +7,7 @@
 //   2. Zero-cost `nil` & disabled recorder short-circuit overhead (`ns/op`, 0 allocs)
 //   3. Single-threaded hot-path ingestion (`event_emit`, `counter_add`, `scoped_span`)
 //   4. Nested cross-library call trees (2-level HTTP->DB & 3-level Gateway->Orders->DB)
-//   5. Static strings (`string_Fallback_copy = false`) vs dynamic string cloning (`true`)
+//   5. Static strings (`string_fallback_copy = false`) vs dynamic string cloning (`true`)
 //   6. Saturation backpressure policies (`.Drop` real-time loop vs `.Block` lossless)
 //   7. Multi-threaded producer scaling (1, 2, 4, 8 OS threads -> 1 OdinArrow worker)
 //   8. End-to-end `.arrow` IPC segment flush & `OdinArrow` columnar readback speed
@@ -31,16 +31,16 @@ import oa "../deps/OdinArrow/src"
 import actor "../deps/sleipnir/actor"
 
 Bench_Result :: struct {
-	name:               string,
-	records:            int,
-	elapsed_ms:         f64,
-	ns_per_record:      f64,
-	mrecs_per_sec:      f64,
-	mb_per_sec:         f64,
-	flushed_segments:   u64,
-	dropped_records:    u64,
-	producer_allocs:    i64,
-	producer_alloc_b:   i64,
+	name:             string,
+	records:          int,
+	elapsed_ms:       f64,
+	ns_per_record:    f64,
+	mrecs_per_sec:    f64,
+	mb_per_sec:       f64,
+	flushed_segments: u64,
+	dropped_records:  u64,
+	producer_allocs:  i64,
+	producer_alloc_b: i64,
 }
 
 @(private)
@@ -51,14 +51,16 @@ g_sink_u64: u64
 
 @(private)
 next_bench_prefix :: proc() -> string {
+	_ = os.make_directory(".tmp")
 	seq := intrinsics.atomic_add(&g_bench_seq, 1)
-	return fmt.tprintf("bench_heimdall_tmp_%d_%d", sync.current_thread_id(), seq)
+	return fmt.tprintf(".tmp/bench_heimdall_tmp_%d_%d", sync.current_thread_id(), seq)
 }
 
 @(private)
 cleanup_arrow_segments :: proc(prefix: string, max_segments := 512) -> (files_removed: int, total_bytes: i64) {
+	buf: [512]byte
 	for i in 0 ..< max_segments {
-		filename := fmt.tprintf("%s_%06d.arrow", prefix, i)
+		filename := fmt.bprintf(buf[:], "%s_%06d.arrow", prefix, i)
 		if !os.exists(filename) {
 			if i > 0 {
 				break
@@ -118,12 +120,92 @@ bench_three_level_call_tree :: #force_inline proc(rec: ^heimdall.Recorder) {
 	heimdall.event_emit(rec, "gateway", "after_response", 999, .Ok)
 }
 
+@(private)
+run_zero_cost_bench :: proc(
+	name:       string,
+	total_recs: int,
+	rec_ptr:    ^^heimdall.Recorder,
+	body:       proc(rec_ptr: ^^heimdall.Recorder),
+) -> Bench_Result {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	prev_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+
+	t0 := time.tick_now()
+	body(rec_ptr)
+	elapsed := time.tick_since(t0)
+	context.allocator = prev_alloc
+
+	return make_bench_result(
+		name,
+		total_recs,
+		elapsed,
+		0,
+		0,
+		track.total_allocation_count,
+		track.total_memory_allocated,
+	)
+}
+
+@(private)
+run_ingestion_bench :: proc(
+	name:          string,
+	total_recs:    int,
+	cfg:           heimdall.Config,
+	body:          proc(rec: ^heimdall.Recorder),
+	measure_flush: bool = true,
+) -> Bench_Result {
+	prefix := next_bench_prefix()
+	defer cleanup_arrow_segments(prefix)
+
+	run_cfg := cfg
+	run_cfg.file_prefix = prefix
+
+	rec: heimdall.Recorder
+	_ = heimdall.recorder_init(&rec, run_cfg)
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	prev_alloc := context.allocator
+	tracked_alloc := mem.tracking_allocator(&track)
+	context.allocator = tracked_alloc
+	rec.allocator = tracked_alloc
+
+	t0 := time.tick_now()
+	body(&rec)
+	producer_elapsed := time.tick_since(t0)
+
+	heimdall.recorder_flush(&rec)
+	producer_allocs  := track.total_allocation_count
+	producer_alloc_b := track.total_memory_allocated
+	context.allocator = prev_alloc
+	heimdall.recorder_destroy(&rec)
+	total_elapsed := time.tick_since(t0)
+
+	elapsed := total_elapsed if measure_flush else producer_elapsed
+	flushed, dropped := heimdall.recorder_diagnostics(&rec)
+
+	return make_bench_result(
+		name,
+		total_recs,
+		elapsed,
+		flushed,
+		dropped,
+		producer_allocs,
+		producer_alloc_b,
+	)
+}
+
 // -----------------------------------------------------------------------------
 // 1. Zero-Cost Disabled / `nil` Benchmarks
 // -----------------------------------------------------------------------------
 
 run_zero_cost_benchmarks :: proc() -> [4]Bench_Result {
-	N :: 20_000_000
+	N     :: 20_000_000
+	ITERS :: 10_000_000
 	results: [4]Bench_Result
 
 	nil_rec: ^heimdall.Recorder = nil
@@ -137,120 +219,59 @@ run_zero_cost_benchmarks :: proc() -> [4]Bench_Result {
 		heimdall.scoped_span(r, "http_lib", "warmup", i64(i))
 	}
 
-	// 1a. `scoped_span(nil, ...)`
-	{
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< N {
-			r := intrinsics.volatile_load(&nil_rec)
-			g := heimdall.scoped_span(r, "http_lib", "handle_request", i64(i))
-			if g.span_id != 0 {
-				g_sink_u64 += g.span_id
+	results[0] = run_zero_cost_bench(
+		"scoped_span(nil) [RAII guard]",
+		N,
+		&nil_rec,
+		proc(rec_ptr: ^^heimdall.Recorder) {
+			for i in 0 ..< N {
+				r := intrinsics.volatile_load(rec_ptr)
+				g := heimdall.scoped_span(r, "http_lib", "handle_request", i64(i))
+				if g.span_id != 0 {
+					g_sink_u64 += g.span_id
+				}
 			}
-		}
-		elapsed := time.tick_since(t0)
-		context.allocator = prev_alloc
+		},
+	)
 
-		results[0] = make_bench_result(
-			"scoped_span(nil) [RAII guard]",
-			N,
-			elapsed,
-			0,
-			0,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
-
-	// 1b. `counter_add(nil, ...)`
-	{
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< N {
-			r := intrinsics.volatile_load(&nil_rec)
-			heimdall.counter_add(r, "http_lib", "requests_total", 1.0, i64(i))
-		}
-		elapsed := time.tick_since(t0)
-		context.allocator = prev_alloc
-
-		results[1] = make_bench_result(
-			"counter_add(nil) [point metric]",
-			N,
-			elapsed,
-			0,
-			0,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
-
-	// 1c. `scoped_span(&disabled_rec, ...)`
-	{
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< N {
-			r := intrinsics.volatile_load(&disabled_ptr)
-			g := heimdall.scoped_span(r, "http_lib", "handle_request", i64(i))
-			if g.span_id != 0 {
-				g_sink_u64 += g.span_id
+	results[1] = run_zero_cost_bench(
+		"counter_add(nil) [point metric]",
+		N,
+		&nil_rec,
+		proc(rec_ptr: ^^heimdall.Recorder) {
+			for i in 0 ..< N {
+				r := intrinsics.volatile_load(rec_ptr)
+				heimdall.counter_add(r, "http_lib", "requests_total", 1.0, i64(i))
 			}
-		}
-		elapsed := time.tick_since(t0)
-		context.allocator = prev_alloc
+		},
+	)
 
-		results[2] = make_bench_result(
-			"scoped_span(&disabled_rec)",
-			N,
-			elapsed,
-			0,
-			0,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
+	results[2] = run_zero_cost_bench(
+		"scoped_span(&disabled_rec)",
+		N,
+		&disabled_ptr,
+		proc(rec_ptr: ^^heimdall.Recorder) {
+			for i in 0 ..< N {
+				r := intrinsics.volatile_load(rec_ptr)
+				g := heimdall.scoped_span(r, "http_lib", "handle_request", i64(i))
+				if g.span_id != 0 {
+					g_sink_u64 += g.span_id
+				}
+			}
+		},
+	)
 
-	// 1d. Full 2-library nested call tree (`handle_request` -> `execute_query`, 4 calls) with `nil` recorder
-	{
-		ITERS :: 10_000_000
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< ITERS {
-			r := intrinsics.volatile_load(&nil_rec)
-			bench_http_request(r, i)
-		}
-		elapsed := time.tick_since(t0)
-		context.allocator = prev_alloc
-
-		results[3] = make_bench_result(
-			"nested HTTP->DB (4 calls, nil)",
-			ITERS * 4,
-			elapsed,
-			0,
-			0,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
+	results[3] = run_zero_cost_bench(
+		"nested HTTP->DB (4 calls, nil)",
+		ITERS * 4,
+		&nil_rec,
+		proc(rec_ptr: ^^heimdall.Recorder) {
+			for i in 0 ..< ITERS {
+				r := intrinsics.volatile_load(rec_ptr)
+				bench_http_request(r, i)
+			}
+		},
+	)
 
 	return results
 }
@@ -262,232 +283,84 @@ run_zero_cost_benchmarks :: proc() -> [4]Bench_Result {
 run_single_thread_ingestion_benchmarks :: proc() -> [6]Bench_Result {
 	results: [6]Bench_Result
 	TOTAL_RECS :: 262_144 // 64 pages * 4,096 rows = 4 segments of 16 batches
+	REQ_COUNT  :: TOTAL_RECS / 4
+	TREE_ITERS :: 40_000
+	TREE_RECS  :: TREE_ITERS * 6
+	DYN_RECS   :: 65_536
 
-	// 2a. `event_emit` hot-path (`Block` policy, 8 ring pages, 16 batches/file)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
-			batches_per_file = 16,
-			ring_page_count  = 8,
-			policy           = .Block,
-		})
-
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< TOTAL_RECS {
-			heimdall.event_emit(&rec, "net_lib", "packet_rx", i64(i), .Ok)
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[0] = make_bench_result(
-			"event_emit (.Block + Arrow flush)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
+	base_cfg := heimdall.Config{
+		batches_per_file = 16,
+		ring_page_count  = 8,
+		policy           = .Block,
 	}
 
-	// 2b. `counter_add` hot-path (`Block` policy)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
+	results[0] = run_ingestion_bench(
+		"event_emit (.Block + Arrow flush)",
+		TOTAL_RECS,
+		base_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_RECS {
+				heimdall.event_emit(rec, "net_lib", "packet_rx", i64(i), .Ok)
+			}
+		},
+	)
 
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
-			batches_per_file = 16,
-			ring_page_count  = 8,
-			policy           = .Block,
-		})
+	results[1] = run_ingestion_bench(
+		"counter_add (.Block + Arrow flush)",
+		TOTAL_RECS,
+		base_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_RECS {
+				heimdall.counter_add(rec, "http_lib", "bytes_sent", 512.0, i64(i))
+			}
+		},
+	)
 
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
+	results[2] = run_ingestion_bench(
+		"scoped_span (1-level RAII + flush)",
+		TOTAL_RECS,
+		base_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_RECS {
+				heimdall.scoped_span(rec, "codec_lib", "decode_frame", i64(i))
+			}
+		},
+	)
 
-		t0 := time.tick_now()
-		for i in 0 ..< TOTAL_RECS {
-			heimdall.counter_add(&rec, "http_lib", "bytes_sent", 512.0, i64(i))
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
+	results[3] = run_ingestion_bench(
+		"2-level HTTP->DB tree (4 recs/req)",
+		TOTAL_RECS,
+		base_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< REQ_COUNT {
+				bench_http_request(rec, i * 64)
+			}
+		},
+	)
 
-		results[1] = make_bench_result(
-			"counter_add (.Block + Arrow flush)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
+	results[4] = run_ingestion_bench(
+		"3-level call tree (6 recs/req)",
+		TREE_RECS,
+		base_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for _ in 0 ..< TREE_ITERS {
+				bench_three_level_call_tree(rec)
+			}
+		},
+	)
 
-	// 2c. `scoped_span` single-level RAII (`span_begin` + `tick_now` + `tick_since` + `span_end`)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
-			batches_per_file = 16,
-			ring_page_count  = 8,
-			policy           = .Block,
-		})
-
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< TOTAL_RECS {
-			heimdall.scoped_span(&rec, "codec_lib", "decode_frame", i64(i))
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[2] = make_bench_result(
-			"scoped_span (1-level RAII + flush)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
-
-	// 2d. 2-Level Nested `HTTP -> DB` Call Tree (4 records/request = 262,144 records)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
-			batches_per_file = 16,
-			ring_page_count  = 8,
-			policy           = .Block,
-		})
-
-		REQ_COUNT :: TOTAL_RECS / 4
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< REQ_COUNT {
-			bench_http_request(&rec, i * 64)
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[3] = make_bench_result(
-			"2-level HTTP->DB tree (4 recs/req)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
-
-	// 2e. 3-Level Nested `Gateway -> Auth + Orders -> Cache + DB` Call Tree (6 records/request)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
-			batches_per_file = 16,
-			ring_page_count  = 8,
-			policy           = .Block,
-		})
-
-		TREE_ITERS :: 40_000
-		TREE_RECS  :: TREE_ITERS * 6
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for _ in 0 ..< TREE_ITERS {
-			bench_three_level_call_tree(&rec)
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[4] = make_bench_result(
-			"3-level call tree (6 recs/req)",
-			TREE_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
-
-	// 2f. Dynamic string cloning (`string_Fallback_copy = true`)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		DYN_RECS :: 65_536
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix          = prefix,
-			batches_per_file     = 16,
-			ring_page_count      = 8,
-			string_Fallback_copy = true,
-			policy               = .Block,
-		})
-
-		t0 := time.tick_now()
-		for i in 0 ..< DYN_RECS {
-			heimdall.event_emit(&rec, "dynamic_worker", "dynamic_op", i64(i), .Ok)
-		}
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[5] = make_bench_result(
-			"event_emit (string_Fallback_copy)",
-			DYN_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			i64(DYN_RECS * 2),
-			i64(DYN_RECS * (len("dynamic_worker") + len("dynamic_op"))),
-		)
-	}
+	dyn_cfg := base_cfg
+	dyn_cfg.string_fallback_copy = true
+	results[5] = run_ingestion_bench(
+		"event_emit (string_fallback_copy)",
+		DYN_RECS,
+		dyn_cfg,
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< DYN_RECS {
+				heimdall.event_emit(rec, "dynamic_worker", "dynamic_op", i64(i), .Ok)
+			}
+		},
+	)
 
 	return results
 }
@@ -501,81 +374,37 @@ run_backpressure_benchmarks :: proc() -> [2]Bench_Result {
 	BURST_RECS :: 500_000
 
 	// 3a. `.Drop` Policy under 500k burst (never blocks caller even when ring saturates)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
+	results[0] = run_ingestion_bench(
+		"500k burst (.Drop non-blocking)",
+		BURST_RECS,
+		heimdall.Config{
 			batches_per_file = 16,
 			ring_page_count  = 4,
 			policy           = .Drop,
-		})
-
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< BURST_RECS {
-			heimdall.event_emit(&rec, "audio_dsp", "process_buffer", i64(i), .Ok)
-		}
-		producer_elapsed := time.tick_since(t0)
-		context.allocator = prev_alloc
-
-		heimdall.recorder_destroy(&rec)
-
-		results[0] = make_bench_result(
-			"500k burst (.Drop non-blocking)",
-			BURST_RECS,
-			producer_elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
+		},
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< BURST_RECS {
+				heimdall.event_emit(rec, "audio_dsp", "process_buffer", i64(i), .Ok)
+			}
+		},
+		measure_flush = false,
+	)
 
 	// 3b. `.Block` Policy under 500k burst (waits for background worker, 0 drops)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
+	results[1] = run_ingestion_bench(
+		"500k burst (.Block zero-drop)",
+		BURST_RECS,
+		heimdall.Config{
 			batches_per_file = 16,
 			ring_page_count  = 8,
 			policy           = .Block,
-		})
-
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		prev_alloc := context.allocator
-		context.allocator = mem.tracking_allocator(&track)
-
-		t0 := time.tick_now()
-		for i in 0 ..< BURST_RECS {
-			heimdall.event_emit(&rec, "ledger_svc", "commit_tx", i64(i), .Ok)
-		}
-		context.allocator = prev_alloc
-		heimdall.recorder_destroy(&rec)
-		total_elapsed := time.tick_since(t0)
-
-		results[1] = make_bench_result(
-			"500k burst (.Block zero-drop)",
-			BURST_RECS,
-			total_elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			track.total_allocation_count,
-			track.total_memory_allocated,
-		)
-	}
+		},
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< BURST_RECS {
+				heimdall.event_emit(rec, "ledger_svc", "commit_tx", i64(i), .Ok)
+			}
+		},
+	)
 
 	return results
 }
@@ -640,13 +469,14 @@ run_multithreaded_scaling_benchmarks :: proc() -> [4]Bench_Result {
 		heimdall.recorder_destroy(&rec)
 		elapsed := time.tick_since(t0)
 
+		flushed, dropped := heimdall.recorder_diagnostics(&rec)
 		label := fmt.tprintf("%d producer thread(s) -> 1 worker", t_cnt)
 		results[idx] = make_bench_result(
 			label,
 			total_records,
 			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
+			flushed,
+			dropped,
 			0,
 			0,
 		)
@@ -684,75 +514,45 @@ bench_actor_receive :: proc(
 	actor.complete_token(ctx, 1)
 }
 
-run_sleipnir_actor_benchmarks :: proc() -> [3]Bench_Result {
-	results: [3]Bench_Result
+run_sleipnir_actor_benchmarks :: proc() -> [7]Bench_Result {
+	results: [7]Bench_Result
 	TOTAL_REQS :: 64_000 // 64,000 HTTP requests * 4 records/req = 256,000 records
 	TOTAL_RECS :: TOTAL_REQS * 4
 
 	// 5a. Baseline `.Dedicated_Thread` backend (64k HTTP requests = 256k records)
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
+	results[0] = run_ingestion_bench(
+		".Dedicated_Thread (1 producer -> 1 worker)",
+		TOTAL_RECS,
+		heimdall.Config{
 			batches_per_file = 16,
 			ring_page_count  = 16,
 			policy           = .Block,
 			backend          = .Dedicated_Thread,
-		})
-
-		t0 := time.tick_now()
-		for i in 0 ..< TOTAL_REQS {
-			bench_http_request(&rec, i)
-		}
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[0] = make_bench_result(
-			".Dedicated_Thread (1 producer -> 1 worker)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			0,
-			0,
-		)
-	}
+		},
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_REQS {
+				bench_http_request(rec, i)
+			}
+		},
+	)
 
 	// 5b. `.Sleipnir_Actor` with standalone owned 1-worker `actor.Scheduler`
-	{
-		prefix := next_bench_prefix()
-		defer cleanup_arrow_segments(prefix)
-
-		rec: heimdall.Recorder
-		_ = heimdall.recorder_init(&rec, heimdall.Config{
-			file_prefix      = prefix,
+	results[1] = run_ingestion_bench(
+		".Sleipnir_Actor (standalone 1-worker sched)",
+		TOTAL_RECS,
+		heimdall.Config{
 			batches_per_file = 16,
 			ring_page_count  = 16,
 			policy           = .Block,
 			backend          = .Sleipnir_Actor,
 			scheduler        = nil,
-		})
-
-		t0 := time.tick_now()
-		for i in 0 ..< TOTAL_REQS {
-			bench_http_request(&rec, i)
-		}
-		heimdall.recorder_destroy(&rec)
-		elapsed := time.tick_since(t0)
-
-		results[1] = make_bench_result(
-			".Sleipnir_Actor (standalone 1-worker sched)",
-			TOTAL_RECS,
-			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
-			0,
-			0,
-		)
-	}
+		},
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_REQS {
+				bench_http_request(rec, i)
+			}
+		},
+	)
 
 	// 5c. `.Sleipnir_Actor` sharing a 4-worker `actor.Scheduler` with 4 application actors
 	{
@@ -779,6 +579,13 @@ run_sleipnir_actor_benchmarks :: proc() -> [3]Bench_Result {
 		REQS_PER_MSG   :: TOTAL_REQS / (ACTORS_COUNT * MSGS_PER_ACTOR) // 250 HTTP requests (1,000 records) per actor turn
 
 		actors: [ACTORS_COUNT]^actor.Actor(Bench_Actor_State, Bench_Actor_Batch_Msg)
+		defer {
+			for a in actors {
+				if a != nil {
+					actor.destroy(a)
+				}
+			}
+		}
 		for a_idx in 0 ..< ACTORS_COUNT {
 			a, _ := actor.spawn(
 				&sched,
@@ -804,12 +611,177 @@ run_sleipnir_actor_benchmarks :: proc() -> [3]Bench_Result {
 		heimdall.recorder_destroy(&rec)
 		elapsed := time.tick_since(t0)
 
+		flushed, dropped := heimdall.recorder_diagnostics(&rec)
 		results[2] = make_bench_result(
 			".Sleipnir_Actor (4 actors on shared sched)",
 			TOTAL_RECS,
 			elapsed,
-			rec.flushed_batches,
-			rec.dropped_records,
+			flushed,
+			dropped,
+			0,
+			0,
+		)
+	}
+
+	// 5d. `.Sleipnir_Actor` with 8 live synchronous `recorder_flush` (`actor.call(.Flush_Sync)`) checkpoints
+	results[3] = run_ingestion_bench(
+		".Sleipnir_Actor (live .Flush_Sync x8)",
+		TOTAL_RECS,
+		heimdall.Config{
+			batches_per_file = 8,
+			ring_page_count  = 8,
+			policy           = .Block,
+			backend          = .Sleipnir_Actor,
+			scheduler        = nil,
+		},
+		proc(rec: ^heimdall.Recorder) {
+			CHUNK :: TOTAL_REQS / 8
+			for c in 0 ..< 8 {
+				base := c * CHUNK
+				for i in 0 ..< CHUNK {
+					bench_http_request(rec, base + i)
+				}
+				heimdall.recorder_flush(rec)
+			}
+		},
+	)
+
+	// 5e. `.Sleipnir_Actor` under tight 2-page ring `.Block` backpressure saturation (standalone sched)
+	results[4] = run_ingestion_bench(
+		".Sleipnir_Actor (standalone 2-page .Block)",
+		TOTAL_RECS,
+		heimdall.Config{
+			batches_per_file = 16,
+			ring_page_count  = 2,
+			policy           = .Block,
+			backend          = .Sleipnir_Actor,
+			scheduler        = nil,
+		},
+		proc(rec: ^heimdall.Recorder) {
+			for i in 0 ..< TOTAL_REQS {
+				bench_http_request(rec, i)
+			}
+		},
+	)
+
+	// 5f. `.Sleipnir_Actor` under tight 2-page ring `.Block` saturation with 4 actors on a shared 4-worker scheduler
+	{
+		prefix := next_bench_prefix()
+		defer cleanup_arrow_segments(prefix)
+
+		sched: actor.Scheduler
+		_ = actor.scheduler_init_workers(&sched, 4, true)
+		actor.scheduler_start(&sched)
+		defer actor.scheduler_stop_and_destroy(&sched)
+
+		rec: heimdall.Recorder
+		_ = heimdall.recorder_init(&rec, heimdall.Config{
+			file_prefix      = prefix,
+			batches_per_file = 16,
+			ring_page_count  = 2,
+			policy           = .Block,
+			backend          = .Sleipnir_Actor,
+			scheduler        = &sched,
+		})
+
+		ACTORS_COUNT   :: 4
+		MSGS_PER_ACTOR :: 64
+		REQS_PER_MSG   :: TOTAL_REQS / (ACTORS_COUNT * MSGS_PER_ACTOR)
+
+		actors: [ACTORS_COUNT]^actor.Actor(Bench_Actor_State, Bench_Actor_Batch_Msg)
+		defer {
+			for a in actors {
+				if a != nil {
+					actor.destroy(a)
+				}
+			}
+		}
+		for a_idx in 0 ..< ACTORS_COUNT {
+			a, _ := actor.spawn(
+				&sched,
+				Bench_Actor_State{rec = &rec, actor_idx = a_idx + 1},
+				bench_actor_receive,
+				u32(a_idx + 1),
+			)
+			actors[a_idx] = a
+		}
+
+		t0 := time.tick_now()
+		intrinsics.atomic_store_explicit(&sched.pending_tokens, i64(ACTORS_COUNT * MSGS_PER_ACTOR), .Release)
+		for m in 0 ..< MSGS_PER_ACTOR {
+			for a_idx in 0 ..< ACTORS_COUNT {
+				actor.send(actors[a_idx], Bench_Actor_Batch_Msg{
+					batch_requests = REQS_PER_MSG,
+					batch_offset   = m * REQS_PER_MSG,
+				})
+			}
+		}
+		actor.scheduler_wait_tokens(&sched)
+		actor.scheduler_wait_idle(&sched)
+		heimdall.recorder_destroy(&rec)
+		elapsed := time.tick_since(t0)
+
+		flushed, dropped := heimdall.recorder_diagnostics(&rec)
+		results[5] = make_bench_result(
+			".Sleipnir_Actor (shared sched 2-page .Block)",
+			TOTAL_RECS,
+			elapsed,
+			flushed,
+			dropped,
+			0,
+			0,
+		)
+	}
+
+	// 5g. `.Sleipnir_Actor` rapid lifecycle churn (`recorder_init` + 16k recs + `.Flush_Sync` + `.Shutdown` x16 on shared sched)
+	{
+		CYCLES         :: 16
+		REQS_PER_CYCLE :: TOTAL_REQS / CYCLES // 4,000 HTTP requests (16,000 records) per cycle
+		sched: actor.Scheduler
+		_ = actor.scheduler_init_workers(&sched, 4, true)
+		actor.scheduler_start(&sched)
+		defer actor.scheduler_stop_and_destroy(&sched)
+
+		prefixes: [CYCLES]string
+		for c in 0 ..< CYCLES {
+			prefixes[c] = next_bench_prefix()
+		}
+		defer {
+			for c in 0 ..< CYCLES {
+				cleanup_arrow_segments(prefixes[c])
+			}
+		}
+
+		total_flushed: u64
+		total_dropped: u64
+		t0 := time.tick_now()
+		for c in 0 ..< CYCLES {
+			rec: heimdall.Recorder
+			_ = heimdall.recorder_init(&rec, heimdall.Config{
+				file_prefix      = prefixes[c],
+				batches_per_file = 4,
+				ring_page_count  = 4,
+				policy           = .Block,
+				backend          = .Sleipnir_Actor,
+				scheduler        = &sched,
+			})
+			for i in 0 ..< REQS_PER_CYCLE {
+				bench_http_request(&rec, c * REQS_PER_CYCLE + i)
+			}
+			heimdall.recorder_flush(&rec)
+			heimdall.recorder_destroy(&rec)
+			flushed, dropped := heimdall.recorder_diagnostics(&rec)
+			total_flushed += flushed
+			total_dropped += dropped
+		}
+		elapsed := time.tick_since(t0)
+
+		results[6] = make_bench_result(
+			".Sleipnir_Actor (lifecycle .Shutdown x16)",
+			TOTAL_RECS,
+			elapsed,
+			total_flushed,
+			total_dropped,
 			0,
 			0,
 		)
@@ -823,16 +795,16 @@ run_sleipnir_actor_benchmarks :: proc() -> [3]Bench_Result {
 // -----------------------------------------------------------------------------
 
 Arrow_IO_Report :: struct {
-	total_rows:        int,
-	segment_files:     int,
-	total_file_bytes:  i64,
-	bytes_per_row:     f64,
-	write_ms:          f64,
-	write_mrows_sec:   f64,
-	write_mb_sec:      f64,
-	read_ms:           f64,
-	read_mrows_sec:    f64,
-	read_mb_sec:       f64,
+	total_rows:       int,
+	segment_files:    int,
+	total_file_bytes: i64,
+	bytes_per_row:    f64,
+	write_ms:         f64,
+	write_mrows_sec:  f64,
+	write_mb_sec:     f64,
+	read_ms:          f64,
+	read_mrows_sec:   f64,
+	read_mb_sec:      f64,
 }
 
 run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
@@ -840,10 +812,10 @@ run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
 	defer cleanup_arrow_segments(prefix)
 
 	// 4 segments * 16 batches * 4,096 rows = 262,144 rows
-	SEGMENTS      :: 4
-	BATCHES_FILE  :: 16
-	TOTAL_ROWS    :: SEGMENTS * BATCHES_FILE * heimdall.BATCH_CAP
-	TOTAL_REQS    :: TOTAL_ROWS / 4
+	SEGMENTS     :: 4
+	BATCHES_FILE :: 16
+	TOTAL_ROWS   :: SEGMENTS * BATCHES_FILE * heimdall.BATCH_CAP
+	TOTAL_REQS   :: TOTAL_ROWS / 4
 
 	rec: heimdall.Recorder
 	_ = heimdall.recorder_init(&rec, heimdall.Config{
@@ -861,11 +833,12 @@ run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
 	write_elapsed := time.tick_since(t_write0)
 
 	// Measure OdinArrow `ipc_read_file` columnar scan across all 4 `.arrow` segment files
-	t_read0 := time.tick_now()
+	t_read0   := time.tick_now()
 	rows_read := 0
 	checksum: i64 = 0
+	buf: [512]byte
 	for seg_idx in 0 ..< SEGMENTS {
-		filename := fmt.tprintf("%s_%06d.arrow", prefix, seg_idx)
+		filename := fmt.bprintf(buf[:], "%s_%06d.arrow", prefix, seg_idx)
 		sc, batches, ok := oa.ipc_read_file(filename)
 		if !ok {
 			continue
