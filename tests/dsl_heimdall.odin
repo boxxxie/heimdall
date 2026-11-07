@@ -452,15 +452,18 @@ then_ast_analyzes_telemetry_call_sites :: proc(
 	expected_unique_names:    int,
 	expected_dynamic_hazards: int,
 	expected_misplaced_spans: int,
+	expected_actor_calls:     int = 0,
 	loc := #caller_location,
 ) {
 	report, ok := driver_analyze_telemetry_call_sites(instrumented_src)
 	testing.expect(s.t, ok, "Expected instrumented source to parse into AST", loc = loc)
-	testing.expect_value(s.t, report.call_sites_inspected,   expected_total_calls,     loc = loc)
-	testing.expect_value(s.t, report.unique_static_scopes,   expected_unique_scopes,   loc = loc)
-	testing.expect_value(s.t, report.unique_static_names,    expected_unique_names,    loc = loc)
-	testing.expect_value(s.t, report.dynamic_string_hazards, expected_dynamic_hazards, loc = loc)
-	testing.expect_value(s.t, report.misplaced_scoped_spans, expected_misplaced_spans, loc = loc)
+	testing.expect_value(s.t, report.call_sites_inspected,     expected_total_calls,     loc = loc)
+	testing.expect_value(s.t, report.unique_static_scopes,     expected_unique_scopes,   loc = loc)
+	testing.expect_value(s.t, report.unique_static_names,      expected_unique_names,    loc = loc)
+	testing.expect_value(s.t, report.dynamic_string_hazards,   expected_dynamic_hazards, loc = loc)
+	testing.expect_value(s.t, report.misplaced_scoped_spans,   expected_misplaced_spans, loc = loc)
+	testing.expect_value(s.t, report.actor_handler_call_sites, expected_actor_calls,     loc = loc)
+	testing.expect_value(s.t, report.actor_backend_recommended, expected_actor_calls > 0, loc = loc)
 }
 
 then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist :: proc(

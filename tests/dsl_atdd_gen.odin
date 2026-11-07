@@ -89,7 +89,7 @@ Suite_Ctx_VTable :: struct {
 	then_multithreaded_span_trees_are_isolated: proc(s: ^Suite_Ctx, expected_total_rows: int, expected_unique_spans: int, expected_root_spans: int, expected_min_threads: int, loc := #caller_location),
 	then_ast_enforces_four_layer_atdd_contract: proc(s: ^Suite_Ctx, tests_dir: string, sut_dir: string, loc := #caller_location),
 	then_ast_detects_layer_violations_in_synthetic_spec: proc(s: ^Suite_Ctx, synthetic_spec_src: string, synthetic_dsl_src: string, expected_non_test_procs: int, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
-	then_ast_analyzes_telemetry_call_sites: proc(s: ^Suite_Ctx, instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location),
+	then_ast_analyzes_telemetry_call_sites: proc(s: ^Suite_Ctx, instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, expected_actor_calls: int = 0, loc := #caller_location),
 	then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist: proc(s: ^Suite_Ctx, thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location),
 	upon_running_blocking_producer_woken_by_disable: proc(s: ^Suite_Ctx, total_events: int, loc := #caller_location),
 	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(s: ^Suite_Ctx, expected_flushed_batches: int, loc := #caller_location),
@@ -211,7 +211,7 @@ Then_DSL :: struct {
 	multithreaded_span_trees_are_isolated: proc(expected_total_rows: int, expected_unique_spans: int, expected_root_spans: int, expected_min_threads: int, loc := #caller_location),
 	ast_enforces_four_layer_atdd_contract: proc(tests_dir: string, sut_dir: string, loc := #caller_location),
 	ast_detects_layer_violations_in_synthetic_spec: proc(synthetic_spec_src: string, synthetic_dsl_src: string, expected_non_test_procs: int, expected_sut_calls: int, expected_testing_calls: int, expected_zero_arg_steps: int, expected_driver_leaks: int, expected_forbidden_imps: int, expected_do_statements: int, loc := #caller_location),
-	ast_analyzes_telemetry_call_sites: proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location),
+	ast_analyzes_telemetry_call_sites: proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, expected_actor_calls: int = 0, loc := #caller_location),
 	multithreaded_dynamic_strings_with_unsynchronized_arena_persist: proc(thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location),
 	partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(expected_flushed_batches: int, loc := #caller_location),
 	ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema: proc(expected_custom_schema_cols: int, loc := #caller_location),
@@ -376,8 +376,8 @@ then_ast_detects_layer_violations_in_synthetic_spec_ambient :: #force_inline pro
 	then_ast_detects_layer_violations_in_synthetic_spec(current_scenario(loc), synthetic_spec_src, synthetic_dsl_src, expected_non_test_procs, expected_sut_calls, expected_testing_calls, expected_zero_arg_steps, expected_driver_leaks, expected_forbidden_imps, expected_do_statements, loc)
 }
 
-then_ast_analyzes_telemetry_call_sites_ambient :: #force_inline proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, loc := #caller_location) {
-	then_ast_analyzes_telemetry_call_sites(current_scenario(loc), instrumented_src, expected_total_calls, expected_unique_scopes, expected_unique_names, expected_dynamic_hazards, expected_misplaced_spans, loc)
+then_ast_analyzes_telemetry_call_sites_ambient :: #force_inline proc(instrumented_src: string, expected_total_calls: int, expected_unique_scopes: int, expected_unique_names: int, expected_dynamic_hazards: int, expected_misplaced_spans: int, expected_actor_calls: int = 0, loc := #caller_location) {
+	then_ast_analyzes_telemetry_call_sites(current_scenario(loc), instrumented_src, expected_total_calls, expected_unique_scopes, expected_unique_names, expected_dynamic_hazards, expected_misplaced_spans, expected_actor_calls, loc)
 }
 
 then_multithreaded_dynamic_strings_with_unsynchronized_arena_persist_ambient :: #force_inline proc(thread_count: int, iterations_per_thread: int, expected_total_rows: int, loc := #caller_location) {

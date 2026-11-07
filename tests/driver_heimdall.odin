@@ -369,6 +369,31 @@ driver_emit_events_with_live_temp_canary :: proc(
 	return
 }
 
+@(private)
+Auto_Detect_Actor_State :: struct {
+	prefix: string,
+	policy: heimdall.Backpressure_Policy,
+}
+
+@(private)
+auto_detect_actor_receive :: proc(ctx: ^actor.Context, state: ^Auto_Detect_Actor_State, msg: ^int) {
+	rec: heimdall.Recorder
+	if heimdall.recorder_init(&rec, heimdall.Config{
+		file_prefix      = state.prefix,
+		batches_per_file = 1,
+		ring_page_count  = 2,
+		policy           = state.policy,
+		backend          = .Auto,
+	}) != nil {
+		actor.reply(ctx, int(-1))
+		return
+	}
+	resolved := int(rec.cfg.backend)
+	heimdall.event_emit(&rec, "auto_actor", "ping", i64(msg^), .Ok)
+	heimdall.recorder_destroy(&rec)
+	actor.reply(ctx, resolved)
+}
+
 driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 	s:                  ^Suite_Ctx,
 	cycles:             int,
@@ -411,6 +436,76 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 			iso_rec._sched != &s.shared_sched
 		heimdall.recorder_destroy(&iso_rec)
 		if !ambient_preserved {
+			return 0, 0
+		}
+	}
+
+	// Verify `Backend_Mode.Auto` runtime detection & explicit `.Dedicated_Thread` override:
+	//   1. `backend = .Auto` inside an actor handler on a 4-worker scheduler -> resolves to `.Sleipnir_Actor`
+	//   2. `backend = .Auto, policy = .Block` inside an actor handler on a 1-worker scheduler -> resolves to `.Dedicated_Thread`
+	//   3. `backend = .Dedicated_Thread` override with `scheduler = &s.shared_sched` -> forces `.Dedicated_Thread`
+	{
+		auto_buf: [512]byte
+		auto_prefix := fmt.bprintf(auto_buf[:], "%s_auto_detect", s.file_prefix)
+		defer driver_cleanup_segment_files(auto_prefix)
+
+		// 1. Inside 4-worker scheduler actor handler -> `.Sleipnir_Actor`
+		probe_4w, p4_err := actor.spawn(
+			&s.shared_sched,
+			Auto_Detect_Actor_State{prefix = auto_prefix, policy = .Block},
+			auto_detect_actor_receive,
+			901,
+		)
+		if p4_err != .None || probe_4w == nil {
+			return 0, 0
+		}
+		mode_4w := actor.call(&s.shared_sched, probe_4w, 1, int)
+		actor.destroy(probe_4w)
+		driver_cleanup_segment_files(auto_prefix)
+		if mode_4w != int(heimdall.Backend_Mode.Sleipnir_Actor) {
+			return 0, 0
+		}
+
+		// 2. Inside 1-worker scheduler actor handler with `.Block` policy -> `.Dedicated_Thread`
+		sched_1w: actor.Scheduler
+		if actor.scheduler_init_workers(&sched_1w, 1, true) != .None {
+			return 0, 0
+		}
+		actor.scheduler_start(&sched_1w)
+		probe_1w, p1_err := actor.spawn(
+			&sched_1w,
+			Auto_Detect_Actor_State{prefix = auto_prefix, policy = .Block},
+			auto_detect_actor_receive,
+			902,
+		)
+		if p1_err != .None || probe_1w == nil {
+			actor.scheduler_stop_and_destroy(&sched_1w)
+			return 0, 0
+		}
+		mode_1w := actor.call(&sched_1w, probe_1w, 2, int)
+		actor.destroy(probe_1w)
+		actor.scheduler_stop_and_destroy(&sched_1w)
+		driver_cleanup_segment_files(auto_prefix)
+		if mode_1w != int(heimdall.Backend_Mode.Dedicated_Thread) {
+			return 0, 0
+		}
+
+		// 3. Explicit `.Dedicated_Thread` override even when `scheduler != nil`
+		override_rec: heimdall.Recorder
+		if heimdall.recorder_init(&override_rec, heimdall.Config{
+			file_prefix      = auto_prefix,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			backend          = .Dedicated_Thread,
+			scheduler        = &s.shared_sched,
+		}) != nil {
+			return 0, 0
+		}
+		override_ok := (override_rec.cfg.backend == .Dedicated_Thread) &&
+			(override_rec._worker != nil) &&
+			(override_rec._flusher_actor == nil)
+		heimdall.recorder_destroy(&override_rec)
+		if !override_ok {
 			return 0, 0
 		}
 	}

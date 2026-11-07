@@ -136,14 +136,20 @@ handle_request :: proc(rec: ^heimdall.Recorder, user_id: int, trace_enabled: boo
 
 	heimdall.scoped_span(rec, "db.sql", "misplaced_tail_span", 2)
 }
+
+worker_actor_receive :: proc(ctx: ^actor.Context, state: ^Worker_State, msg: ^int) {
+	heimdall.scoped_span(state.rec, "net.http", "handle_request", i64(msg^))
+	heimdall.counter_add(state.rec, "net.http", "requests_total", 1.0, i64(msg^))
+}
 `
 	then.ast_analyzes_telemetry_call_sites(
 		instrumented_src         = instrumented_app_src,
-		expected_total_calls     = 9,
+		expected_total_calls     = 11,
 		expected_unique_scopes   = 3, // "auth.jwt", "db.sql", "net.http"
 		expected_unique_names    = 7, // "handle_request", "misplaced_before_return", "misplaced_case_span", "misplaced_if_span", "misplaced_tail_span", "named_verify", "requests_total"
 		expected_dynamic_hazards = 1, // fmt.tprintf("user_%d", user_id)
 		expected_misplaced_spans = 4, // sole stmt in `if` + before `return` + `switch` `case` + last stmt in proc body
+		expected_actor_calls     = 2, // 2 calls inside `worker_actor_receive(ctx: ^actor.Context, ...)`
 	)
 
 	// 5. Verify the AST codegen rejects calls to undefined Layer 2 DSL steps (`unknown_dsl_calls`),

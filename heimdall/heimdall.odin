@@ -82,8 +82,9 @@ Backpressure_Policy :: enum u8 {
 }
 
 Backend_Mode :: enum u8 {
-	Dedicated_Thread = 0, // Default: dedicated background OS thread owns OdinArrow + disk I/O
-	Sleipnir_Actor   = 1, // Runs the OdinArrow serializer as a Sleipnir Actor on an `actor.Scheduler`
+	Auto             = 0, // Default: automatically detects the ideal backend (.Dedicated_Thread vs .Sleipnir_Actor)
+	Dedicated_Thread = 1, // Explicit override: dedicated background OS thread owns OdinArrow + disk I/O
+	Sleipnir_Actor   = 2, // Explicit override: runs the OdinArrow serializer as a Sleipnir Actor on an `actor.Scheduler`
 }
 
 Config :: struct {
@@ -92,7 +93,7 @@ Config :: struct {
 	ring_page_count:      int,                 // Default: 4 pages in the producer/consumer ring
 	string_fallback_copy: bool,                // Set true if passing dynamically freed strings
 	policy:               Backpressure_Policy,
-	backend:              Backend_Mode,        // Default: .Dedicated_Thread (or .Sleipnir_Actor if `scheduler != nil`)
+	backend:              Backend_Mode,        // Default: .Auto (detects live actor turn / scheduler, or overrides with .Dedicated_Thread / .Sleipnir_Actor)
 	scheduler:            ^actor.Scheduler,    // Optional shared Sleipnir Scheduler (auto-creates 1-worker scheduler if nil in `.Sleipnir_Actor` mode)
 }
 
@@ -350,6 +351,35 @@ default_recorder :: #force_inline proc() -> ^Recorder {
 // Lifecycle Management & Diagnostics
 // -----------------------------------------------------------------------------
 
+// Inspects `cfg` and the calling thread's live Sleipnir `actor.Context` to determine
+// the optimal execution backend (`.Dedicated_Thread` vs `.Sleipnir_Actor`) and target scheduler:
+//   - Explicit `.Dedicated_Thread` override always selects a dedicated OS worker thread.
+//   - Explicit `cfg.scheduler != nil` (when `backend != .Dedicated_Thread`) attaches to `cfg.scheduler`.
+//   - Explicit `.Sleipnir_Actor` override attaches to `actor.current_context().sched` if called inside
+//     a live actor handler, or auto-creates a standalone 1-worker scheduler (`sched == nil`).
+//   - Default `.Auto` (`0`) selects `.Sleipnir_Actor` on `ctx.sched` when `recorder_init` is called
+//     inside a live Sleipnir actor turn with spare worker capacity (`num_workers >= 2` or `.Drop` policy),
+//     and otherwise defaults to `.Dedicated_Thread` so blocking disk I/O never stalls compute workers.
+resolve_ideal_backend :: proc(cfg: Config) -> (mode: Backend_Mode, sched: ^actor.Scheduler) {
+	if cfg.backend == .Dedicated_Thread {
+		return .Dedicated_Thread, nil
+	}
+	if cfg.scheduler != nil {
+		return .Sleipnir_Actor, cfg.scheduler
+	}
+	ctx := actor.current_context()
+	if ctx != nil && ctx.sched != nil && ctx.sched.started &&
+	   intrinsics.atomic_load_explicit(&ctx.sched.running, .Acquire) {
+		if cfg.backend == .Sleipnir_Actor || ctx.sched.num_workers >= 2 || cfg.policy == .Drop {
+			return .Sleipnir_Actor, ctx.sched
+		}
+	}
+	if cfg.backend == .Sleipnir_Actor {
+		return .Sleipnir_Actor, nil
+	}
+	return .Dedicated_Thread, nil
+}
+
 recorder_init :: proc(
 	r: ^Recorder,
 	cfg := Config{},
@@ -370,9 +400,9 @@ recorder_init :: proc(
 		r.cfg.ring_page_count = DEFAULT_RING_PAGES
 	}
 
-	if r.cfg.scheduler != nil {
-		r.cfg.backend = .Sleipnir_Actor
-	}
+	resolved_mode, resolved_sched := resolve_ideal_backend(r.cfg)
+	r.cfg.backend   = resolved_mode
+	r.cfg.scheduler = resolved_sched
 
 	defer if err != nil {
 		for i in 0 ..< len(r._pages) {

@@ -48,13 +48,15 @@ Telemetry_Schema_Spec :: struct {
 }
 
 Telemetry_Call_Site_Report :: struct {
-	call_sites_inspected:   int,
-	static_string_literals: int,
-	unique_static_scopes:   int,
-	unique_static_names:    int,
-	unique_static_strings:  int,
-	dynamic_string_hazards: int,
-	misplaced_scoped_spans: int,
+	call_sites_inspected:      int,
+	static_string_literals:    int,
+	unique_static_scopes:      int,
+	unique_static_names:       int,
+	unique_static_strings:     int,
+	dynamic_string_hazards:    int,
+	misplaced_scoped_spans:    int,
+	actor_handler_call_sites:  int,
+	actor_backend_recommended: bool,
 }
 
 init_telemetry_schema_spec :: proc(s: ^Telemetry_Schema_Spec) {
@@ -522,10 +524,42 @@ count_misplaced_scoped_spans_in_stmt_list :: proc(stmts: []^ast.Stmt) -> int {
 
 @(private)
 Call_Site_Walk_Ctx :: struct {
-	report:     ^Telemetry_Call_Site_Report,
-	scope_set:  ^map[string]bool,
-	name_set:   ^map[string]bool,
-	string_set: ^map[string]bool,
+	report:           ^Telemetry_Call_Site_Report,
+	scope_set:        ^map[string]bool,
+	name_set:         ^map[string]bool,
+	string_set:       ^map[string]bool,
+	in_actor_handler: bool,
+}
+
+@(private)
+type_expr_is_sleipnir_actor :: proc(expr: ^ast.Expr) -> bool {
+	if expr == nil {
+		return false
+	}
+	#partial switch t in expr.derived {
+	case ^ast.Pointer_Type:
+		return type_expr_is_sleipnir_actor(t.elem)
+	case ^ast.Call_Expr:
+		return type_expr_is_sleipnir_actor(t.expr)
+	case ^ast.Selector_Expr:
+		if pkg, is_id := t.expr.derived.(^ast.Ident); is_id && pkg.name == "actor" {
+			return t.field.name == "Context" || t.field.name == "Actor" || t.field.name == "PID"
+		}
+	}
+	return false
+}
+
+@(private)
+proc_lit_is_sleipnir_actor_handler :: proc(pl: ^ast.Proc_Lit) -> bool {
+	if pl == nil || pl.type == nil || pl.type.params == nil {
+		return false
+	}
+	for field in pl.type.params.list {
+		if type_expr_is_sleipnir_actor(field.type) {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -558,6 +592,16 @@ call_site_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Vis
 	}
 	ctx := (^Call_Site_Walk_Ctx)(visitor.data)
 	#partial switch n in node.derived {
+	case ^ast.Proc_Lit:
+		if proc_lit_is_sleipnir_actor_handler(n) {
+			prev_actor := ctx.in_actor_handler
+			ctx.in_actor_handler = true
+			if n.body != nil {
+				ast.walk(visitor, n.body)
+			}
+			ctx.in_actor_handler = prev_actor
+			return nil
+		}
 	case ^ast.Block_Stmt:
 		// If `scoped_span(...)` is the LAST statement of a block (or immediately precedes
 		// a trivial `return`), `@(deferred_out = span_end)` exits immediately without
@@ -568,6 +612,10 @@ call_site_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Vis
 	case ^ast.Call_Expr:
 		if _, _, is_tel := is_heimdall_telemetry_call(n.expr); is_tel {
 			ctx.report.call_sites_inspected += 1
+			if ctx.in_actor_handler {
+				ctx.report.actor_handler_call_sites += 1
+				ctx.report.actor_backend_recommended = true
+			}
 			for arg, arg_idx in n.args {
 				if fv, is_fv := arg.derived.(^ast.Field_Value); is_fv {
 					if ident, ok := fv.field.derived.(^ast.Ident); ok {
