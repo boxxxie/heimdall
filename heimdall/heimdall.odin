@@ -1308,6 +1308,14 @@ flusher_engine_drain_ready_pages :: proc(eng: ^Flusher_Engine, force_flush: bool
 	if flush_gen < r._flush_target_gen && r._ready_count == 0 {
 		flush_gen = r._flush_target_gen
 	}
+	needs_actor_resignal := r.cfg.backend == .Sleipnir_Actor &&
+		r._ready_count > 0 &&
+		!r._worker_paused &&
+		!r._shutdown &&
+		r._flusher_actor != nil &&
+		r._sched != nil
+	resignal_sched   := r._sched
+	resignal_flusher := r._flusher_actor
 	sync.mutex_unlock(&r._mu)
 
 	if should_force_flush && len(eng.segment_batches) > 0 {
@@ -1322,6 +1330,10 @@ flusher_engine_drain_ready_pages :: proc(eng: ^Flusher_Engine, force_flush: bool
 		r._flush_requested = (r._flush_completed_gen < r._flush_target_gen)
 		sync.cond_broadcast(&r._cv_flush_done)
 		sync.mutex_unlock(&r._mu)
+	}
+
+	if needs_actor_resignal {
+		actor.send(resignal_sched, resignal_flusher, Flusher_Msg{kind = .Drain_Ready})
 	}
 }
 
@@ -1446,4 +1458,18 @@ build_string_column_from_soa :: #force_inline proc(
 		offset     = 0,
 		buffers    = {{}, off_buf, data_buf},
 	}, true
+}
+
+@(private)
+decode_string_from_buffers :: #force_inline proc(
+	offsets: [^]i32,
+	bytes:   [^]u8,
+	row_idx: int,
+) -> string {
+	start := int(offsets[row_idx])
+	end   := int(offsets[row_idx + 1])
+	if end <= start || bytes == nil {
+		return ""
+	}
+	return string(bytes[start:end])
 }

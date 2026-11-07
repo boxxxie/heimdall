@@ -8,15 +8,15 @@
 
 1. **Decoupled Ingestion (`#soa` Ring) & Configurable Background Backend (`Dedicated_Thread` or `Sleipnir_Actor`):**
    Producers write directly into pre-allocated `#soa[BATCH_CAP]Record` pages (`BATCH_CAP :: 4096`) and copy entire `#soa` columns into Arrow buffers via `mem.copy_non_overlapping`. The background serializer can run either on a dedicated OS thread (`backend = .Dedicated_Thread`, default) or as a [**Sleipnir**](deps/sleipnir) actor (`backend = .Sleipnir_Actor`, optionally sharing your application's `actor.Scheduler` via `Config.scheduler`).
-2. **Canonical 11-Column OpenTelemetry-Style Schema:**
-   Represents **Spans, Counters, Gauges, Histograms, and Events** from any library in a uniform columnar layout (`timestamp_ns`, `duration_ns`, `span_id`, `parent_id`, `thread_id`, `kind`, `status`, `scope`, `name`, `value_f64`, `attr_i64`), automatically wiring parent-child call trees across libraries via `@(thread_local) tls_active_span_id`.
+2. **AST-Generated 11-Column OpenTelemetry-Style Schema (`heimdall/schema_gen.odin`):**
+   Represents **Spans, Counters, Gauges, Histograms, and Events** from any library in a uniform columnar layout (`timestamp_ns`, `duration_ns`, `span_id`, `parent_id`, `thread_id`, `kind`, `status`, `scope`, `name`, `value_f64`, `attr_i64`). `tools/heimdall_gen` parses `Record` via `core:odin/parser` to generate `make_record_arrow_schema`, `stage_record_into_soa`, `build_arrow_batch`, and zero-copy `Record_Batch_Reader`. Parent-child call trees are automatically wired across libraries via per-`(Recorder, Actor_Turn)` thread-local span slots (`tls_active_span_id`).
 3. **Zero-Cost Ergonomics ("Zero Is Initialization" + `@(deferred_out)`):**
    Library procedures can accept an optional `^heimdall.Recorder` (or fall back to `heimdall.default_recorder()`). When `recorder == nil` or disabled, instrumentation calls short-circuit in a single branch. Using `@(deferred_out = span_end)` on `scoped_span` instruments any procedure in one line and records nanosecond duration on any scope exit.
-4. **4-Layer ATDD Architecture & Odin AST DSL (`heimdall/codegen`, `tools/heimdall_gen`, `tests/`):**
+4. **4-Layer ATDD Architecture & Odin AST Analyzers (`heimdall/codegen`, `tools/heimdall_gen`, `tests/`):**
    - **Layer 1 (`tests/spec_*.odin`):** Pure domain specifications using AST-generated `given.*` / `upon.*` / `then.*` ambient namespaces and `s->step(...)` selector syntax, plus `@(deferred_out)` RAII `scenario(t)` teardown.
    - **Layer 2 (`tests/dsl_heimdall.odin` + `tests/dsl_atdd_gen.odin`):** Domain-specific language scanned by `heimdall/codegen` (`core:odin/parser` + `core:odin/ast`) to generate ambient wrappers and selector vtables.
    - **Layer 3 (`tests/driver_heimdall.odin`):** Protocol driver isolating all `OdinArrow` IPC reads, `Recorder` lifecycle management, and temporary `.arrow` file cleanup.
-   - **AST Purity Enforcement (`tests/spec_ast_architecture.odin`):** Parses all `tests/*.odin` and `heimdall/*.odin` files at test time to enforce zero Layer 3/4 leaks in Layer 1 specs, zero `do` statements, 100% DSL step coverage, and byte-exact `dsl_atdd_gen.odin` codegen sync.
+   - **AST Purity & Telemetry Call-Site Analysis (`tests/spec_ast_architecture.odin`):** Parses all `tests/*.odin` and `heimdall/*.odin` files at test time to enforce zero Layer 3/4 leaks in Layer 1 specs, zero `do` statements, 100% DSL step coverage, byte-exact `dsl_atdd_gen.odin` and `schema_gen.odin` codegen sync, and static telemetry call-site hazard/interning inspection.
 
 ---
 
@@ -45,8 +45,8 @@ execute_query :: proc(rec: ^heimdall.Recorder, query_id: i64) {
 ## Running Checks, AST Codegen & ATDD Specs
 
 ```bash
-# Regenerate `tests/dsl_atdd_gen.odin` from `tests/dsl_heimdall.odin` via `core:odin/parser`
-odin run tools/heimdall_gen -vet -strict-style -vet-tabs -disallow-do -- tests
+# Regenerate `tests/dsl_atdd_gen.odin` and `heimdall/schema_gen.odin` via `core:odin/parser`
+odin run tools/heimdall_gen -vet -strict-style -vet-tabs -disallow-do -- tests heimdall
 
 # Type-check library, codegen & benchmark packages
 odin check heimdall -no-entry-point -vet -strict-style -vet-tabs -vet-packages:heimdall

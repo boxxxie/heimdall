@@ -600,10 +600,10 @@ run_sleipnir_actor_benchmarks :: proc() -> [7]Bench_Result {
 		intrinsics.atomic_store_explicit(&sched.pending_tokens, i64(ACTORS_COUNT * MSGS_PER_ACTOR), .Release)
 		for m in 0 ..< MSGS_PER_ACTOR {
 			for a_idx in 0 ..< ACTORS_COUNT {
-				actor.send(actors[a_idx], Bench_Actor_Batch_Msg{
+				actor.send(&sched, actors[a_idx], Bench_Actor_Batch_Msg{
 					batch_requests = REQS_PER_MSG,
 					batch_offset   = m * REQS_PER_MSG,
-				})
+				}, a_idx)
 			}
 		}
 		actor.scheduler_wait_tokens(&sched)
@@ -710,10 +710,10 @@ run_sleipnir_actor_benchmarks :: proc() -> [7]Bench_Result {
 		intrinsics.atomic_store_explicit(&sched.pending_tokens, i64(ACTORS_COUNT * MSGS_PER_ACTOR), .Release)
 		for m in 0 ..< MSGS_PER_ACTOR {
 			for a_idx in 0 ..< ACTORS_COUNT {
-				actor.send(actors[a_idx], Bench_Actor_Batch_Msg{
+				actor.send(&sched, actors[a_idx], Bench_Actor_Batch_Msg{
 					batch_requests = REQS_PER_MSG,
 					batch_offset   = m * REQS_PER_MSG,
-				})
+				}, a_idx)
 			}
 		}
 		actor.scheduler_wait_tokens(&sched)
@@ -845,10 +845,10 @@ run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
 		}
 		for &b in batches {
 			rows_read += b.length
-			attr_col := oa.record_batch_column(&b, "attr_i64")
-			if attr_col != nil && b.length > 0 {
-				checksum += oa.array_get(attr_col, 0, i64)
-				checksum += oa.array_get(attr_col, b.length - 1, i64)
+			reader, r_ok := heimdall.record_batch_reader_resolve(&b)
+			if r_ok && b.length > 0 {
+				checksum += reader.attr_i64_data[0]
+				checksum += reader.attr_i64_data[b.length - 1]
 			}
 		}
 		for &b in batches {

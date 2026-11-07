@@ -90,6 +90,19 @@ Record_Batch_Reader :: struct {
 	name_col: ^oa.Array,
 	value_f64_col: ^oa.Array,
 	attr_i64_col: ^oa.Array,
+	timestamp_ns_data: [^]i64,
+	duration_ns_data: [^]i64,
+	span_id_data: [^]u64,
+	parent_id_data: [^]u64,
+	thread_id_data: [^]u32,
+	kind_data: [^]Kind,
+	status_data: [^]Status,
+	scope_offsets: [^]i32,
+	scope_bytes: [^]u8,
+	name_offsets: [^]i32,
+	name_bytes: [^]u8,
+	value_f64_data: [^]f64,
+	attr_i64_data: [^]i64,
 }
 
 record_batch_reader_resolve :: proc(b: ^oa.Record_Batch) -> (reader: Record_Batch_Reader, ok: bool) {
@@ -120,21 +133,37 @@ record_batch_reader_resolve :: proc(b: ^oa.Record_Batch) -> (reader: Record_Batc
 	     reader.name_col != nil &&
 	     reader.value_f64_col != nil &&
 	     reader.attr_i64_col != nil
+	if !ok {
+		return
+	}
+	reader.timestamp_ns_data = (cast([^]i64)reader.timestamp_ns_col.buffers[1].data)[reader.timestamp_ns_col.offset:]
+	reader.duration_ns_data = (cast([^]i64)reader.duration_ns_col.buffers[1].data)[reader.duration_ns_col.offset:]
+	reader.span_id_data = (cast([^]u64)reader.span_id_col.buffers[1].data)[reader.span_id_col.offset:]
+	reader.parent_id_data = (cast([^]u64)reader.parent_id_col.buffers[1].data)[reader.parent_id_col.offset:]
+	reader.thread_id_data = (cast([^]u32)reader.thread_id_col.buffers[1].data)[reader.thread_id_col.offset:]
+	reader.kind_data = (cast([^]Kind)reader.kind_col.buffers[1].data)[reader.kind_col.offset:]
+	reader.status_data = (cast([^]Status)reader.status_col.buffers[1].data)[reader.status_col.offset:]
+	reader.scope_offsets = (cast([^]i32)reader.scope_col.buffers[1].data)[reader.scope_col.offset:]
+	reader.scope_bytes = reader.scope_col.buffers[2].data
+	reader.name_offsets = (cast([^]i32)reader.name_col.buffers[1].data)[reader.name_col.offset:]
+	reader.name_bytes = reader.name_col.buffers[2].data
+	reader.value_f64_data = (cast([^]f64)reader.value_f64_col.buffers[1].data)[reader.value_f64_col.offset:]
+	reader.attr_i64_data = (cast([^]i64)reader.attr_i64_col.buffers[1].data)[reader.attr_i64_col.offset:]
 	return
 }
 
 record_batch_reader_decode_row :: #force_inline proc(reader: ^Record_Batch_Reader, row_idx: int) -> Record {
 	return Record{
-		timestamp_ns = oa.array_get(reader.timestamp_ns_col, row_idx, i64),
-		duration_ns = oa.array_get(reader.duration_ns_col, row_idx, i64),
-		span_id = oa.array_get(reader.span_id_col, row_idx, u64),
-		parent_id = oa.array_get(reader.parent_id_col, row_idx, u64),
-		thread_id = oa.array_get(reader.thread_id_col, row_idx, u32),
-		kind = Kind(oa.array_get(reader.kind_col, row_idx, u8)),
-		status = Status(oa.array_get(reader.status_col, row_idx, u8)),
-		scope = oa.array_get_string(reader.scope_col, row_idx),
-		name = oa.array_get_string(reader.name_col, row_idx),
-		value_f64 = oa.array_get(reader.value_f64_col, row_idx, f64),
-		attr_i64 = oa.array_get(reader.attr_i64_col, row_idx, i64),
+		timestamp_ns = reader.timestamp_ns_data[row_idx],
+		duration_ns = reader.duration_ns_data[row_idx],
+		span_id = reader.span_id_data[row_idx],
+		parent_id = reader.parent_id_data[row_idx],
+		thread_id = reader.thread_id_data[row_idx],
+		kind = reader.kind_data[row_idx],
+		status = reader.status_data[row_idx],
+		scope = decode_string_from_buffers(reader.scope_offsets, reader.scope_bytes, row_idx),
+		name = decode_string_from_buffers(reader.name_offsets, reader.name_bytes, row_idx),
+		value_f64 = reader.value_f64_data[row_idx],
+		attr_i64 = reader.attr_i64_data[row_idx],
 	}
 }

@@ -1077,6 +1077,73 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 		}
 	}
 
+	// Verify `Record_Batch_Reader` direct pointer caching with non-zero `Array.offset`
+	// (sliced columns via `oa.array_slice(col, 1, 5)`).
+	sliced_cols := make([]oa.Array, len(batches_c[0].columns), context.temp_allocator)
+	for c_idx in 0 ..< len(batches_c[0].columns) {
+		sliced_cols[c_idx] = oa.array_slice(batches_c[0].columns[c_idx], 1, 5)
+	}
+	sliced_batch := oa.Record_Batch{
+		schema  = batches_c[0].schema,
+		columns = sliced_cols,
+		length  = 4,
+	}
+	sliced_reader, ok_sliced := heimdall.record_batch_reader_resolve(&sliced_batch)
+	if !ok_sliced {
+		cross_recorder_leaks += 1
+	} else {
+		for s_idx in 0 ..< sliced_batch.length {
+			orig_row   := heimdall.record_batch_reader_decode_row(&cols_c, s_idx + 1)
+			sliced_row := heimdall.record_batch_reader_decode_row(&sliced_reader, s_idx)
+			if sliced_row != orig_row {
+				cross_recorder_leaks += 1
+			}
+		}
+	}
+
+	// Verify 64-ID TLS span batching across 2 interleaved recorders (`70 > SPAN_ID_BATCH_SIZE :: 64`)
+	// AND verify that re-initializing `rec_coop` at the exact same memory address resets `span_id` to 1.
+	{
+		buf_reinit: [512]byte
+		prefix_reinit := fmt.bprintf(buf_reinit[:], "%s_reinit_span", s.file_prefix)
+		defer driver_cleanup_segment_files(prefix_reinit)
+
+		if heimdall.recorder_init(&rec_coop, heimdall.Config{
+			file_prefix      = prefix_reinit,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+		}) != nil {
+			cross_recorder_leaks += 1
+			return
+		}
+		for s_iter in 1 ..= 70 {
+			g := heimdall.span_begin(&rec_coop, "batch_lib", "batch_span", i64(s_iter))
+			if g.span_id != u64(s_iter) {
+				cross_recorder_leaks += 1
+			}
+			heimdall.span_end(g)
+		}
+		heimdall.recorder_destroy(&rec_coop)
+		driver_cleanup_segment_files(prefix_reinit)
+
+		// Re-initialize at the exact same `&rec_coop` address: `_instance_id` must invalidate
+		// the previous `tls_span_id_cache` entry so the first span starts back at `span_id == 1`.
+		if heimdall.recorder_init(&rec_coop, heimdall.Config{
+			file_prefix      = prefix_reinit,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+		}) != nil {
+			cross_recorder_leaks += 1
+			return
+		}
+		g_first := heimdall.span_begin(&rec_coop, "batch_lib", "reinit_first", 1)
+		if g_first.span_id != 1 {
+			cross_recorder_leaks += 1
+		}
+		heimdall.span_end(g_first)
+		heimdall.recorder_destroy(&rec_coop)
+	}
+
 	return
 }
 
@@ -1504,7 +1571,10 @@ Custom_Tick :: struct {
 	)
 	if schema_ok &&
 		strings.contains(schema_code, "RECORD_COLUMN_COUNT :: 4") &&
-		strings.contains(schema_code, "Custom_Tick") {
+		strings.contains(schema_code, "Custom_Tick") &&
+		strings.contains(schema_code, "tick_ns_data: [^]i64") &&
+		strings.contains(schema_code, "subsystem_offsets: [^]i32") &&
+		strings.contains(schema_code, "subsystem_bytes: [^]u8") {
 		custom_schema_cols = col_count
 	}
 	return
@@ -1538,51 +1608,61 @@ driver_verify_live_flushes_under_continuous_producer_load :: proc(
 	flushes_completed: bool,
 	zero_drops:        bool,
 ) {
-	load_buf: [512]byte
-	load_prefix := fmt.bprintf(load_buf[:], "%s_cont_flush", s.file_prefix)
-	defer driver_cleanup_segment_files(load_prefix)
+	backends := [2]heimdall.Backend_Mode{.Dedicated_Thread, .Sleipnir_Actor}
+	flushes_completed = true
+	zero_drops        = true
 
-	rec: heimdall.Recorder
-	if heimdall.recorder_init(&rec, heimdall.Config{
-		file_prefix      = load_prefix,
-		batches_per_file = 2,
-		ring_page_count  = 2,
-		policy           = .Block,
-		backend          = .Dedicated_Thread,
-	}) != nil {
-		return false, false
-	}
+	for mode, b_idx in backends {
+		load_buf: [512]byte
+		load_prefix := fmt.bprintf(load_buf[:], "%s_cont_flush_%d", s.file_prefix, b_idx)
+		defer driver_cleanup_segment_files(load_prefix)
 
-	stop_flag: b32 = false
-	n_prod := clamp(producer_count, 1, 4)
-	threads: [4]^thread.Thread
-	args:    [4]Continuous_Load_Args
-	for i in 0 ..< n_prod {
-		args[i] = Continuous_Load_Args{
-			rec       = &rec,
-			stop_flag = &stop_flag,
+		rec: heimdall.Recorder
+		if heimdall.recorder_init(&rec, heimdall.Config{
+			file_prefix      = load_prefix,
+			batches_per_file = 2,
+			ring_page_count  = 2,
+			policy           = .Block,
+			backend          = mode,
+		}) != nil {
+			return false, false
 		}
-		threads[i] = thread.create_and_start_with_poly_data(&args[i], continuous_producer_load_proc)
-	}
 
-	for _ in 0 ..< flush_calls {
-		heimdall.event_emit(&rec, "cont_load", "flush_marker", 1, .Ok)
-		heimdall.recorder_flush(&rec)
-	}
+		stop_flag: b32 = false
+		n_prod := clamp(producer_count, 1, 4)
+		threads: [4]^thread.Thread
+		args:    [4]Continuous_Load_Args
+		for i in 0 ..< n_prod {
+			args[i] = Continuous_Load_Args{
+				rec       = &rec,
+				stop_flag = &stop_flag,
+			}
+			threads[i] = thread.create_and_start_with_poly_data(&args[i], continuous_producer_load_proc)
+		}
 
-	flushed_during_load, _ := heimdall.recorder_diagnostics(&rec)
-	intrinsics.atomic_store_explicit(&stop_flag, true, .Release)
+		for _ in 0 ..< flush_calls {
+			heimdall.event_emit(&rec, "cont_load", "flush_marker", 1, .Ok)
+			heimdall.recorder_flush(&rec)
+		}
 
-	for i in 0 ..< n_prod {
-		if threads[i] != nil {
-			thread.join(threads[i])
-			thread.destroy(threads[i])
+		flushed_during_load, _ := heimdall.recorder_diagnostics(&rec)
+		intrinsics.atomic_store_explicit(&stop_flag, true, .Release)
+
+		for i in 0 ..< n_prod {
+			if threads[i] != nil {
+				thread.join(threads[i])
+				thread.destroy(threads[i])
+			}
+		}
+
+		heimdall.recorder_destroy(&rec)
+		total_flushed, total_dropped := heimdall.recorder_diagnostics(&rec)
+		if flushed_during_load < 1 || total_flushed < u64(flush_calls) {
+			flushes_completed = false
+		}
+		if total_dropped != 0 {
+			zero_drops = false
 		}
 	}
-
-	heimdall.recorder_destroy(&rec)
-	total_flushed, total_dropped := heimdall.recorder_diagnostics(&rec)
-	flushes_completed = (flushed_during_load >= 1 && total_flushed >= u64(flush_calls))
-	zero_drops        = (total_dropped == 0)
 	return
 }

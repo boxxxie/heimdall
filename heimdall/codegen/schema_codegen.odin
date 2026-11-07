@@ -256,6 +256,14 @@ emit_telemetry_schema_code :: proc(
 	for f in spec.fields {
 		fmt.sbprintf(&sb, "\t%s_col: ^oa.Array,\n", f.name)
 	}
+	for f in spec.fields {
+		if f.is_string {
+			fmt.sbprintf(&sb, "\t%s_offsets: [^]i32,\n", f.name)
+			fmt.sbprintf(&sb, "\t%s_bytes: [^]u8,\n", f.name)
+		} else {
+			fmt.sbprintf(&sb, "\t%s_data: [^]%s,\n", f.name, f.odin_type)
+		}
+	}
 	fmt.sbprintln(&sb, "}\n")
 
 	fmt.sbprintln(&sb, "record_batch_reader_resolve :: proc(b: ^oa.Record_Batch) -> (reader: Record_Batch_Reader, ok: bool) {")
@@ -275,6 +283,17 @@ emit_telemetry_schema_code :: proc(
 		fmt.sbprintf(&sb, "reader.%s_col != nil", f.name)
 	}
 	fmt.sbprintln(&sb)
+	fmt.sbprintln(&sb, "\tif !ok {")
+	fmt.sbprintln(&sb, "\t\treturn")
+	fmt.sbprintln(&sb, "\t}")
+	for f in spec.fields {
+		if f.is_string {
+			fmt.sbprintf(&sb, "\treader.%s_offsets = (cast([^]i32)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n", f.name, f.name, f.name)
+			fmt.sbprintf(&sb, "\treader.%s_bytes = reader.%s_col.buffers[2].data\n", f.name, f.name)
+		} else {
+			fmt.sbprintf(&sb, "\treader.%s_data = (cast([^]%s)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n", f.name, f.odin_type, f.name, f.name)
+		}
+	}
 	fmt.sbprintln(&sb, "\treturn")
 	fmt.sbprintln(&sb, "}\n")
 
@@ -282,11 +301,9 @@ emit_telemetry_schema_code :: proc(
 	fmt.sbprintf(&sb, "\treturn %s{{\n", rec_name)
 	for f in spec.fields {
 		if f.is_string {
-			fmt.sbprintf(&sb, "\t\t%s = oa.array_get_string(reader.%s_col, row_idx),\n", f.name, f.name)
-		} else if f.is_enum {
-			fmt.sbprintf(&sb, "\t\t%s = %s(oa.array_get(reader.%s_col, row_idx, %s)),\n", f.name, f.odin_type, f.name, f.primitive_type)
+			fmt.sbprintf(&sb, "\t\t%s = decode_string_from_buffers(reader.%s_offsets, reader.%s_bytes, row_idx),\n", f.name, f.name, f.name)
 		} else {
-			fmt.sbprintf(&sb, "\t\t%s = oa.array_get(reader.%s_col, row_idx, %s),\n", f.name, f.name, f.odin_type)
+			fmt.sbprintf(&sb, "\t\t%s = reader.%s_data[row_idx],\n", f.name, f.name)
 		}
 	}
 	fmt.sbprintln(&sb, "\t}")
