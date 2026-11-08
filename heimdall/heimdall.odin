@@ -462,7 +462,8 @@ recorder_init :: proc(
 	}
 
 	r.epoch_offset_ns = realtime_now_ns() - monotonic_now_ns()
-	r._instance_id    = intrinsics.atomic_add_explicit(&g_next_recorder_instance_id, 1, .Relaxed) + 1
+	new_inst_id      := intrinsics.atomic_add_explicit(&g_next_recorder_instance_id, 1, .Relaxed) + 1
+	intrinsics.atomic_store_explicit(&r._instance_id, new_inst_id, .Release)
 	r._next_span_id   = 1
 
 	if r.cfg.backend == .Sleipnir_Actor {
@@ -611,7 +612,30 @@ recorder_destroy :: proc(r: ^Recorder) {
 	delete(r._free_stack, page_alloc)
 	delete(r._ready_ring, page_alloc)
 	delete(r._owned_file_prefix, page_alloc)
-	r^ = {}
+
+	sync.mutex_lock(&r._mu)
+	r._pages             = nil
+	r._free_stack        = nil
+	r._ready_ring        = nil
+	r._owned_file_prefix = ""
+	r.cfg.file_prefix    = ""
+	r._active_page_idx   = -1
+	r._free_top          = 0
+	r._ready_head        = 0
+	r._ready_tail        = 0
+	r._ready_count       = 0
+	r._waiting_producers = 0
+	r._worker_sleeping   = false
+	r._worker_paused     = false
+	r._flush_requested   = false
+	r._eng               = {}
+	r._worker            = nil
+	r._sched             = nil
+	r._owned_sched       = false
+	r._flusher_actor     = nil
+	intrinsics.atomic_store_explicit(&r._instance_id, 0, .Release)
+	sync.mutex_unlock(&r._mu)
+
 	r.allocator         = alloc
 	r._page_alloc       = page_alloc
 	r._dropped_records  = dropped
@@ -740,19 +764,28 @@ recorder_set_worker_paused :: proc(r: ^Recorder, paused: bool) {
 	if r == nil {
 		return
 	}
+	notify_sched: ^actor.Scheduler
+	notify_actor: ^actor.Actor(Flusher_Engine, Flusher_Msg)
+
 	sync.mutex_lock(&r._mu)
 	r._worker_paused = paused
 	has_ready := r._ready_count > 0
 	if !paused {
 		if r.cfg.backend == .Sleipnir_Actor {
-			if has_ready && r._flusher_actor != nil {
-				actor.send(r._sched, r._flusher_actor, Flusher_Msg{kind = .Drain_Ready})
+			if has_ready && !r._shutdown && r._flusher_actor != nil && r._sched != nil {
+				r._inflight_actor_calls += 1
+				notify_sched = r._sched
+				notify_actor = r._flusher_actor
 			}
 		} else {
 			sync.cond_signal(&r._cv_work_ready)
 		}
 	}
 	sync.mutex_unlock(&r._mu)
+
+	if notify_actor != nil {
+		send_flusher_drain_outside_lock(r, notify_sched, notify_actor)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -919,6 +952,7 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	final_status := g.status
 	final_attr   := g.attr_i64
 
+	cur_inst := intrinsics.atomic_load_explicit(&g.recorder._instance_id, .Acquire)
 	env      := current_actor_env()
 	slot_idx := int(g.tls_slot_idx)
 	slot: ^TLS_Recorder_Span
@@ -928,7 +962,7 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	   tls_recorder_spans[slot_idx].actor_env == env &&
 	   tls_recorder_spans[slot_idx].span_id == g.span_id {
 		slot = &tls_recorder_spans[slot_idx]
-	} else if g.recorder._instance_id == g.recorder_id {
+	} else if cur_inst == g.recorder_id {
 		found := tls_find_recorder_slot(g.recorder)
 		if found != nil && found.span_id == g.span_id {
 			slot = found
@@ -966,6 +1000,13 @@ span_end :: #force_inline proc(g: Span_Guard) {
 		}
 	}
 
+	if cur_inst != g.recorder_id {
+		if g.strings_cloned && cur_inst == 0 {
+			free_cloned_pair(g.recorder, g.scope, g.name)
+		}
+		return
+	}
+
 	record_raw(
 		g.recorder,
 		ts_ns,
@@ -980,6 +1021,7 @@ span_end :: #force_inline proc(g: Span_Guard) {
 		f64(dur_ns) / 1e6, // Convenience: duration in ms in value_f64
 		final_attr,
 		g.strings_cloned,
+		g.recorder_id,
 	)
 }
 
@@ -1053,12 +1095,12 @@ recorder_locked_allocator_proc :: proc(
 	loc := #caller_location,
 ) -> ([]byte, mem.Allocator_Error) {
 	r := (^Recorder)(allocator_data)
-	if r == nil || r.allocator.procedure == nil {
+	if r == nil || r._page_alloc.procedure == nil {
 		return nil, .Invalid_Pointer
 	}
 	sync.mutex_lock(&r._alloc_mu)
 	defer sync.mutex_unlock(&r._alloc_mu)
-	return r.allocator.procedure(r.allocator.data, mode, size, alignment, old_memory, old_size, loc)
+	return r._page_alloc.procedure(r._page_alloc.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 @(private)
@@ -1138,26 +1180,27 @@ ready_ring_pop_locked :: #force_inline proc(r: ^Recorder) -> int {
 
 @(private)
 record_raw :: #force_inline proc(
-	r:              ^Recorder,
-	timestamp_ns:   i64,
-	duration_ns:    i64,
-	span_id:        u64,
-	parent_id:      u64,
-	thread_id:      u32,
-	kind:           Kind,
-	status:         Status,
-	scope:          string,
-	name:           string,
-	value_f64:      f64,
-	attr_i64:       i64,
-	already_cloned: bool = false,
+	r:                    ^Recorder,
+	timestamp_ns:         i64,
+	duration_ns:          i64,
+	span_id:              u64,
+	parent_id:            u64,
+	thread_id:            u32,
+	kind:                 Kind,
+	status:               Status,
+	scope:                string,
+	name:                 string,
+	value_f64:            f64,
+	attr_i64:             i64,
+	already_cloned:       bool = false,
+	expected_instance_id: u64  = 0,
 ) {
 	stored_scope := scope
 	stored_name  := name
 	owns_strings := already_cloned
 
 	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) {
-		if owns_strings {
+		if owns_strings && (expected_instance_id == 0 || intrinsics.atomic_load_explicit(&r._instance_id, .Acquire) == 0 || intrinsics.atomic_load_explicit(&r._instance_id, .Acquire) == expected_instance_id) {
 			free_cloned_pair(r, stored_scope, stored_name)
 		}
 		return
@@ -1176,9 +1219,11 @@ record_raw :: #force_inline proc(
 
 	sync.mutex_lock(&r._mu)
 
-	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) {
+	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) ||
+	   (expected_instance_id != 0 && r._instance_id != expected_instance_id) {
+		can_free := owns_strings && (expected_instance_id == 0 || r._instance_id == 0 || r._instance_id == expected_instance_id)
 		sync.mutex_unlock(&r._mu)
-		if owns_strings {
+		if can_free {
 			free_cloned_pair(r, stored_scope, stored_name)
 		}
 		return
@@ -1198,8 +1243,10 @@ record_raw :: #force_inline proc(
 	page := &r._pages[r._active_page_idx]
 	idx  := page.count
 	page.count = idx + 1
+	notify_sched: ^actor.Scheduler
+	notify_actor: ^actor.Actor(Flusher_Engine, Flusher_Msg)
 	if idx + 1 >= BATCH_CAP {
-		rotate_active_page_locked(r)
+		notify_sched, notify_actor = rotate_active_page_locked(r)
 	}
 	sync.mutex_unlock(&r._mu)
 
@@ -1219,6 +1266,10 @@ record_raw :: #force_inline proc(
 		attr_i64,
 	)
 	_ = intrinsics.atomic_add_explicit(&page.committed, 1, .Release)
+
+	if notify_actor != nil {
+		send_flusher_drain_outside_lock(r, notify_sched, notify_actor)
+	}
 }
 
 @(private)
@@ -1247,7 +1298,31 @@ free_page_strings :: proc(r: ^Recorder, page: ^Staging_Page) {
 }
 
 @(private)
-rotate_active_page_locked :: proc(r: ^Recorder, notify_worker: bool = true) {
+send_flusher_drain_outside_lock :: #force_inline proc(
+	r:       ^Recorder,
+	sched:   ^actor.Scheduler,
+	flusher: ^actor.Actor(Flusher_Engine, Flusher_Msg),
+) {
+	if flusher == nil || sched == nil {
+		return
+	}
+	actor.send(sched, flusher, Flusher_Msg{kind = .Drain_Ready})
+	sync.mutex_lock(&r._mu)
+	r._inflight_actor_calls -= 1
+	if r._inflight_actor_calls == 0 && r._shutdown {
+		sync.cond_broadcast(&r._cv_actor_idle)
+	}
+	sync.mutex_unlock(&r._mu)
+}
+
+@(private)
+rotate_active_page_locked :: proc(
+	r:             ^Recorder,
+	notify_worker: bool = true,
+) -> (
+	notify_sched: ^actor.Scheduler,
+	notify_actor: ^actor.Actor(Flusher_Engine, Flusher_Msg),
+) {
 	was_empty := r._ready_count == 0
 	ready_ring_push_locked(r, r._active_page_idx)
 	if r._free_top > 0 {
@@ -1258,15 +1333,17 @@ rotate_active_page_locked :: proc(r: ^Recorder, notify_worker: bool = true) {
 		r._active_page_idx = -1
 	}
 	if !notify_worker {
-		return
+		return nil, nil
 	}
 	if r.cfg.backend == .Sleipnir_Actor {
-		if was_empty && !r._worker_paused && r._flusher_actor != nil {
-			actor.send(r._sched, r._flusher_actor, Flusher_Msg{kind = .Drain_Ready})
+		if was_empty && !r._worker_paused && !r._shutdown && r._flusher_actor != nil && r._sched != nil {
+			r._inflight_actor_calls += 1
+			return r._sched, r._flusher_actor
 		}
 	} else if r._worker_sleeping {
 		sync.cond_signal(&r._cv_work_ready)
 	}
+	return nil, nil
 }
 
 @(private)
@@ -1372,9 +1449,8 @@ flusher_engine_flush_segment :: proc(eng: ^Flusher_Engine) {
 	}
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	r   := eng.r
-	buf: [512]byte
-	filename := fmt.bprintf(buf[:], "%s_%06d.arrow", r.cfg.file_prefix, eng.file_seq)
+	r        := eng.r
+	filename := fmt.tprintf("%s_%06d.arrow", r.cfg.file_prefix, eng.file_seq)
 	written  := oa.ipc_write_file(filename, &eng.schema, eng.segment_batches[:])
 
 	for &b in eng.segment_batches {
@@ -1551,6 +1627,8 @@ build_primitive_column_from_soa :: #force_inline proc(
 	src_ptr: [^]T,
 	n:       int,
 ) -> (arr: oa.Array, ok: bool) {
+	// Always allocate `BATCH_CAP * size_of(T)` (and set `buf.size = n * size_of(T)`)
+	// so partial and full batches share identical size-class buckets in `oa.Buffer_Pool`.
 	buf, err := oa.buffer_make_uninit(BATCH_CAP * size_of(T))
 	if err != nil {
 		return {}, false
@@ -1573,6 +1651,8 @@ build_string_column_from_soa :: #force_inline proc(
 	src_strings: [^]string,
 	n:           int,
 ) -> (arr: oa.Array, ok: bool) {
+	// Fixed `(BATCH_CAP + 1) * size_of(i32)` offsets capacity and 4 KB-aligned payload
+	// sizes maximize buffer reuse across batches in `oa.Buffer_Pool`.
 	off_buf, off_err := oa.buffer_make_uninit((BATCH_CAP + 1) * size_of(i32))
 	if off_err != nil {
 		return {}, false
@@ -1648,9 +1728,12 @@ decode_string_from_buffers :: #force_inline proc(
 	bytes_size: int,
 	row_idx:    int,
 ) -> string {
+	if offsets == nil || bytes == nil || row_idx < 0 {
+		return ""
+	}
 	start := int(offsets[row_idx])
 	end   := int(offsets[row_idx + 1])
-	if start < 0 || end <= start || end > bytes_size || bytes == nil {
+	if start < 0 || end <= start || end > bytes_size {
 		return ""
 	}
 	return string(bytes[start:end])

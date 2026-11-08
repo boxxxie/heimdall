@@ -60,9 +60,9 @@ driver_cleanup_segment_files :: proc(prefix: string) {
 	if len(prefix) == 0 {
 		return
 	}
-	buf: [512]byte
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	for i in 0 ..< MAX_LOADED_SEGMENTS {
-		filename := fmt.bprintf(buf[:], "%s_%06d.arrow", prefix, i)
+		filename := fmt.tprintf("%s_%06d.arrow", prefix, i)
 		if !os.exists(filename) {
 			if i > 0 {
 				break
@@ -1469,7 +1469,8 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 				ring_page_count  = 2,
 			}) == nil {
 				g_reinit_live := heimdall.span_begin(&rec_coop, "reinit_lib", "new_gen_span", 30)
-				// Ending `g_orphan` from the old `_instance_id` must NOT touch `g_reinit_live`'s TLS slot!
+				// Ending `g_orphan` from the old `_instance_id` must NOT touch `g_reinit_live`'s TLS slot
+				// and must NOT emit a phantom record into the re-initialized `rec_coop`!
 				heimdall.span_end(g_orphan)
 				if heimdall.tls_active_span_id != g_reinit_live.span_id {
 					cross_recorder_leaks += 1
@@ -1478,7 +1479,29 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 				if heimdall.tls_active_span_id != g_b_live.span_id {
 					cross_recorder_leaks += 1
 				}
+				heimdall.recorder_flush(&rec_coop)
 				heimdall.recorder_destroy(&rec_coop)
+				reinit_seg := fmt.tprintf("%s_000000.arrow", prefix_reinit)
+				if reinit_sc, reinit_batches, reinit_ok := oa.ipc_read_file(reinit_seg); reinit_ok {
+					if len(reinit_batches) != 1 || reinit_batches[0].length != 1 {
+						cross_recorder_leaks += 1
+					} else if rr, rr_ok := heimdall.record_batch_reader_resolve(&reinit_batches[0]); rr_ok {
+						row0 := heimdall.record_batch_reader_decode_row(&rr, 0)
+						if row0.scope != "reinit_lib" || row0.name != "new_gen_span" || row0.attr_i64 != 30 {
+							cross_recorder_leaks += 1
+						}
+					} else {
+						cross_recorder_leaks += 1
+					}
+					for &rb in reinit_batches {
+						oa.record_batch_free(&rb)
+					}
+					delete(reinit_batches)
+					oa.schema_free(reinit_sc)
+					free(reinit_sc)
+				} else {
+					cross_recorder_leaks += 1
+				}
 			}
 			heimdall.span_end(g_b_live)
 			heimdall.recorder_destroy(&rec_b)
@@ -1936,7 +1959,9 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 	{
 		sample_bytes := [4]u8{'o', 'k', '!', '!'}
 		bad_offsets  := [4]i32{-2, 2, 1, 99}
-		if heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 0) != "" ||
+		if heimdall.decode_string_from_buffers(nil, nil, 0, 0) != "" ||
+		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), -1) != "" ||
+		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 0) != "" ||
 		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 1) != "" ||
 		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 2) != "" {
 			overflow_guard_clean = false

@@ -183,6 +183,7 @@ run_ingestion_bench :: proc(
 	producer_allocs  := track.total_allocation_count
 	producer_alloc_b := track.total_memory_allocated
 	context.allocator = prev_alloc
+	rec.allocator     = prev_alloc
 	heimdall.recorder_destroy(&rec)
 
 	elapsed := total_elapsed if measure_flush else producer_elapsed

@@ -126,6 +126,11 @@ handle_request :: proc(rec: ^heimdall.Recorder, user_id: int, trace_enabled: boo
 	heimdall.event_emit(rec, attr_i64 = i64(user_id), name = "named_verify", scope = "auth.jwt")
 	heimdall.event_emit(rec, "auth.jwt", fmt.tprintf("user_%d", user_id), i64(user_id))
 
+	if user_id > 1000 {
+		METRIC_REQ := fmt.tprintf("shadowed_%d", user_id)
+		heimdall.counter_add(rec, SCOPE_HTTP, METRIC_REQ, 1.0, i64(user_id))
+	}
+
 	if trace_enabled {
 		heimdall.scoped_span(rec, "net.http", "misplaced_if_span", 1)
 	}
@@ -159,10 +164,10 @@ worker_actor_receive :: proc(ctx: ^actor.Context, state: ^Worker_State, msg: ^in
 `
 	then.ast_analyzes_telemetry_call_sites(
 		instrumented_src         = instrumented_app_src,
-		expected_total_calls     = 13,
+		expected_total_calls     = 14,
 		expected_unique_scopes   = 3, // "auth.jwt", "db.sql", "net.http"
 		expected_unique_names    = 9, // "handle_request", "misplaced_before_break", "misplaced_before_return", "misplaced_case_span", "misplaced_defer_span", "misplaced_if_span", "misplaced_tail_span", "named_verify", "requests_total"
-		expected_dynamic_hazards = 1, // fmt.tprintf("user_%d", user_id)
+		expected_dynamic_hazards = 2, // fmt.tprintf("user_%d", user_id) + shadowed local `METRIC_REQ := fmt.tprintf(...)`
 		expected_misplaced_spans = 6, // sole stmt in `if` + before `return` + `switch` `case` + before `break` + `defer scoped_span` + last stmt in proc body
 		expected_actor_calls     = 2, // 2 calls inside `worker_actor_receive(ctx: ^actor.Context, ...)`
 	)
