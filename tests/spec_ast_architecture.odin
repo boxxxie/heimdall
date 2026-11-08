@@ -69,7 +69,9 @@ then_opaque_mega_step :: proc(s: ^Suite_Ctx) {
 	)
 
 	// 3. Verify that calling a 1-arg `*_ambient` DSL procedure directly in a Layer 1 spec
-	//    is NOT misclassified as a zero-arg mega-step (`expected_zero_arg_steps == 0`).
+	//    is NOT misclassified as a zero-arg mega-step (`expected_zero_arg_steps == 0`),
+	//    and an unrelated local variable named `s` inside `_ = scenario(t)` is NOT
+	//    misflagged as a `driver_field_leaks` violation.
 	valid_ambient_spec_src :: `
 package heimdall_tests
 
@@ -78,8 +80,9 @@ import "core:testing"
 @(test)
 spec_valid_ambient_step_call :: proc(t: ^testing.T) {
 	_ = scenario(t)
-	upon_valid_step_ambient(42)
-	then_valid_outcome_ambient(42)
+	s := struct{ count: int }{ count = 42 }
+	upon_valid_step_ambient(s.count)
+	then_valid_outcome_ambient(s.count)
 }
 `
 	valid_ambient_dsl_src :: `
@@ -113,9 +116,12 @@ package sample_app
 import "core:fmt"
 import "../heimdall"
 
+SCOPE_HTTP :: "net.http"
+METRIC_REQ :: "requests_total"
+
 handle_request :: proc(rec: ^heimdall.Recorder, user_id: int, trace_enabled: bool) {
-	heimdall.scoped_span(rec, "net.http", "handle_request", i64(user_id))
-	heimdall.counter_add(rec, "net.http", "requests_total", 1.0, i64(user_id))
+	heimdall.scoped_span(rec, SCOPE_HTTP, "handle_request", i64(user_id))
+	heimdall.counter_add(rec, SCOPE_HTTP, METRIC_REQ, 1.0, i64(user_id))
 	heimdall.counter_add(rec, "net.http", "requests_total", 1.0, i64(user_id))
 	heimdall.event_emit(rec, attr_i64 = i64(user_id), name = "named_verify", scope = "auth.jwt")
 	heimdall.event_emit(rec, "auth.jwt", fmt.tprintf("user_%d", user_id), i64(user_id))
@@ -134,6 +140,15 @@ handle_request :: proc(rec: ^heimdall.Recorder, user_id: int, trace_enabled: boo
 		heimdall.scoped_span(rec, "net.http", "misplaced_case_span", 3)
 	}
 
+	for i in 0 ..< 2 {
+		if i == 1 {
+			heimdall.scoped_span(rec, "net.http", "misplaced_before_break", 5)
+			break
+		}
+	}
+
+	defer heimdall.scoped_span(rec, "net.http", "misplaced_defer_span", 6)
+
 	heimdall.scoped_span(rec, "db.sql", "misplaced_tail_span", 2)
 }
 
@@ -144,11 +159,11 @@ worker_actor_receive :: proc(ctx: ^actor.Context, state: ^Worker_State, msg: ^in
 `
 	then.ast_analyzes_telemetry_call_sites(
 		instrumented_src         = instrumented_app_src,
-		expected_total_calls     = 11,
+		expected_total_calls     = 13,
 		expected_unique_scopes   = 3, // "auth.jwt", "db.sql", "net.http"
-		expected_unique_names    = 7, // "handle_request", "misplaced_before_return", "misplaced_case_span", "misplaced_if_span", "misplaced_tail_span", "named_verify", "requests_total"
+		expected_unique_names    = 9, // "handle_request", "misplaced_before_break", "misplaced_before_return", "misplaced_case_span", "misplaced_defer_span", "misplaced_if_span", "misplaced_tail_span", "named_verify", "requests_total"
 		expected_dynamic_hazards = 1, // fmt.tprintf("user_%d", user_id)
-		expected_misplaced_spans = 4, // sole stmt in `if` + before `return` + `switch` `case` + last stmt in proc body
+		expected_misplaced_spans = 6, // sole stmt in `if` + before `return` + `switch` `case` + before `break` + `defer scoped_span` + last stmt in proc body
 		expected_actor_calls     = 2, // 2 calls inside `worker_actor_receive(ctx: ^actor.Context, ...)`
 	)
 

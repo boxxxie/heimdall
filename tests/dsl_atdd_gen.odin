@@ -8,15 +8,9 @@ import "../heimdall"
 // Ambient Scenario Context & `@(deferred_out)` Scoped RAII Harness
 // =============================================================================
 
-MAX_SCENARIO_DEPTH :: 4
-
 @(private)
 @(thread_local)
-_scenario_stack: [MAX_SCENARIO_DEPTH]Suite_Ctx
-
-@(private)
-@(thread_local)
-_scenario_depth: int
+_scenario_instance: Suite_Ctx
 
 @(private)
 @(thread_local)
@@ -30,28 +24,23 @@ current_scenario :: #force_inline proc(loc := #caller_location) -> ^Suite_Ctx {
 Scenario_Handle :: struct {
 	using ctx:    ^Suite_Ctx,
 	using vtable: ^Suite_Ctx_VTable,
-	prev_ctx:     ^Suite_Ctx,
 }
 
 @(deferred_out = scenario_scope_end)
 scenario :: proc(t: ^testing.T, loc := #caller_location) -> Scenario_Handle {
 	assert(_active_scenario_ctx == nil, "Active ATDD scenario already running in this scope; wrap sequential scenarios in { } blocks", loc)
-	assert(_scenario_depth < MAX_SCENARIO_DEPTH, "MAX_SCENARIO_DEPTH exceeded; wrap sequential scenarios in { } blocks", loc)
-	s := &_scenario_stack[_scenario_depth]
-	_scenario_depth += 1
+	s := &_scenario_instance
 	s^ = {}
 	driver_init(s, t)
-	prev := _active_scenario_ctx
 	_active_scenario_ctx = s
-	return Scenario_Handle{ctx = s, vtable = &_suite_ctx_vtable, prev_ctx = prev}
+	return Scenario_Handle{ctx = s, vtable = &_suite_ctx_vtable}
 }
 
 scenario_scope_end :: proc(h: Scenario_Handle) {
-	_active_scenario_ctx = h.prev_ctx
+	_active_scenario_ctx = nil
 	if h.ctx != nil {
 		driver_destroy(h.ctx)
 		h.ctx^ = {}
-		_scenario_depth -= 1
 	}
 }
 
@@ -79,7 +68,7 @@ Suite_Ctx_VTable :: struct {
 	upon_flushing_and_shutting_down_recorder: proc(s: ^Suite_Ctx, flush_first: bool = false, loc := #caller_location),
 	then_recorder_default_config_is: proc(s: ^Suite_Ctx, expected_prefix: string, expected_batches_file: int, expected_ring_pages: int, loc := #caller_location),
 	then_oom_recorder_init_rolls_back_and_destroys_cleanly: proc(s: ^Suite_Ctx, arena_bytes: int, requested_pages: int, loc := #caller_location),
-	then_recorder_diagnostics_are: proc(s: ^Suite_Ctx, expected_flushed_segments: u64, expected_dropped_records: u64, loc := #caller_location),
+	then_recorder_diagnostics_are: proc(s: ^Suite_Ctx, expected_flushed_segments: u64, expected_dropped_records: u64, expected_failed_segments: Maybe(u64) = nil, loc := #caller_location),
 	then_drop_backpressure_conserves_total_records: proc(s: ^Suite_Ctx, expected_total_events: int, expected_persisted_rows: int, expected_dropped_rows: int, loc := #caller_location),
 	then_arrow_segment_exists_is: proc(s: ^Suite_Ctx, segment_idx: int, expected_exist: bool, loc := #caller_location),
 	then_arrow_segment_batch_count_is: proc(s: ^Suite_Ctx, segment_idx: int, expected_batches: int, loc := #caller_location),
@@ -203,7 +192,7 @@ Then_DSL :: struct {
 	sleipnir_actor_rapid_lifecycle_cycles_complete_without_uaf: proc(cycles: int, events_per_cycle: int, expected_min_flushed_batches: u64, loc := #caller_location),
 	recorder_default_config_is: proc(expected_prefix: string, expected_batches_file: int, expected_ring_pages: int, loc := #caller_location),
 	oom_recorder_init_rolls_back_and_destroys_cleanly: proc(arena_bytes: int, requested_pages: int, loc := #caller_location),
-	recorder_diagnostics_are: proc(expected_flushed_segments: u64, expected_dropped_records: u64, loc := #caller_location),
+	recorder_diagnostics_are: proc(expected_flushed_segments: u64, expected_dropped_records: u64, expected_failed_segments: Maybe(u64) = nil, loc := #caller_location),
 	drop_backpressure_conserves_total_records: proc(expected_total_events: int, expected_persisted_rows: int, expected_dropped_rows: int, loc := #caller_location),
 	arrow_segment_exists_is: proc(segment_idx: int, expected_exist: bool, loc := #caller_location),
 	arrow_segment_batch_count_is: proc(segment_idx: int, expected_batches: int, loc := #caller_location),
@@ -340,8 +329,8 @@ then_oom_recorder_init_rolls_back_and_destroys_cleanly_ambient :: #force_inline 
 	then_oom_recorder_init_rolls_back_and_destroys_cleanly(current_scenario(loc), arena_bytes, requested_pages, loc)
 }
 
-then_recorder_diagnostics_are_ambient :: #force_inline proc(expected_flushed_segments: u64, expected_dropped_records: u64, loc := #caller_location) {
-	then_recorder_diagnostics_are(current_scenario(loc), expected_flushed_segments, expected_dropped_records, loc)
+then_recorder_diagnostics_are_ambient :: #force_inline proc(expected_flushed_segments: u64, expected_dropped_records: u64, expected_failed_segments: Maybe(u64) = nil, loc := #caller_location) {
+	then_recorder_diagnostics_are(current_scenario(loc), expected_flushed_segments, expected_dropped_records, expected_failed_segments, loc)
 }
 
 then_drop_backpressure_conserves_total_records_ambient :: #force_inline proc(expected_total_events: int, expected_persisted_rows: int, expected_dropped_rows: int, loc := #caller_location) {

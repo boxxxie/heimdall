@@ -40,6 +40,7 @@ Suite_Ctx :: struct {
 	last_flushed_batches: u64,
 	last_dropped_records: u64,
 	file_prefix:          string,
+	custom_prefix:        string,
 	segments:             [MAX_LOADED_SEGMENTS]Loaded_Arrow_Segment,
 }
 
@@ -51,6 +52,7 @@ driver_init :: proc(s: ^Suite_Ctx, t: ^testing.T) {
 	_ = os.make_directory(".tmp")
 	seq := intrinsics.atomic_add(&g_driver_prefix_seq, 1)
 	s.file_prefix = fmt.aprintf(".tmp/test_heimdall_atdd_%d", seq)
+	driver_cleanup_segment_files(s.file_prefix)
 }
 
 @(private)
@@ -106,6 +108,11 @@ driver_destroy :: proc(s: ^Suite_Ctx) {
 	if len(cfg_prefix) > 0 {
 		driver_cleanup_segment_files(cfg_prefix)
 	}
+	if len(s.custom_prefix) > 0 {
+		driver_cleanup_segment_files(s.custom_prefix)
+		delete(s.custom_prefix)
+		s.custom_prefix = ""
+	}
 	if len(s.file_prefix) > 0 {
 		driver_cleanup_segment_files(s.file_prefix)
 		delete(s.file_prefix)
@@ -126,6 +133,11 @@ driver_shutdown_and_cleanup_prior_recorder :: proc(s: ^Suite_Ctx) {
 	if len(old_prefix) > 0 {
 		driver_cleanup_segment_files(old_prefix)
 	}
+	if len(s.custom_prefix) > 0 {
+		driver_cleanup_segment_files(s.custom_prefix)
+		delete(s.custom_prefix)
+		s.custom_prefix = ""
+	}
 }
 
 driver_configure_recorder :: proc(
@@ -145,12 +157,18 @@ driver_configure_recorder :: proc(
 	var_sched: ^actor.Scheduler = nil
 	if shared_scheduler_workers > 0 {
 		if !s.shared_sched_active {
+			prev_amb := actor.current_scheduler()
 			if actor.scheduler_init_workers(&s.shared_sched, shared_scheduler_workers, true) != .None {
+				actor.use_scheduler(prev_amb)
 				return false
 			}
+			actor.use_scheduler(prev_amb)
 			actor.scheduler_start(&s.shared_sched)
-			for intrinsics.atomic_load_explicit(&s.shared_sched.parked_workers, .Acquire) < u32(shared_scheduler_workers) {
-				intrinsics.cpu_relax()
+			for _ in 0 ..< 50 {
+				if intrinsics.atomic_load_explicit(&s.shared_sched.parked_workers, .Acquire) >= u32(shared_scheduler_workers) {
+					break
+				}
+				time.sleep(100 * time.Microsecond)
 			}
 			s.shared_sched_active = true
 		}
@@ -174,6 +192,13 @@ driver_configure_recorder :: proc(
 	if err != nil {
 		return false
 	}
+	if len(s.custom_prefix) > 0 {
+		delete(s.custom_prefix)
+		s.custom_prefix = ""
+	}
+	if len(custom_prefix) > 0 && custom_prefix != s.file_prefix {
+		s.custom_prefix = strings.clone(custom_prefix)
+	}
 	s.rec_active = true
 	return true
 }
@@ -186,6 +211,13 @@ driver_configure_zero_config_recorder :: proc(s: ^Suite_Ctx) -> bool {
 	err := heimdall.recorder_init(&s.rec)
 	if err != nil {
 		return false
+	}
+	if len(s.custom_prefix) > 0 {
+		delete(s.custom_prefix)
+		s.custom_prefix = ""
+	}
+	if len(s.rec.cfg.file_prefix) > 0 && s.rec.cfg.file_prefix != s.file_prefix {
+		s.custom_prefix = strings.clone(s.rec.cfg.file_prefix)
 	}
 	s.rec_active = true
 	return true
@@ -329,6 +361,9 @@ driver_run_sleipnir_actor_producers :: proc(
 		for i in 0 ..< actor_count {
 			actor.send(&s.shared_sched, actors[i], Actor_Producer_Msg{seq = m}, i)
 		}
+		if (m & 15) == 0 {
+			thread.yield()
+		}
 	}
 
 	actor.scheduler_wait_tokens(&s.shared_sched)
@@ -446,10 +481,14 @@ driver_verify_auto_backend_selection_and_overrides :: proc(
 	}
 
 	// 2. Inside 4-worker `actor.Scheduler` handler + `.Auto` (`.Block`) -> `.Sleipnir_Actor` on shared `ctx.sched`
+	prev_amb_auto := actor.current_scheduler()
+	defer actor.use_scheduler(prev_amb_auto)
+
 	sched_4w: actor.Scheduler
 	if actor.scheduler_init_workers(&sched_4w, 4, true) != .None {
 		return
 	}
+	actor.use_scheduler(prev_amb_auto)
 	actor.scheduler_start(&sched_4w)
 	defer actor.scheduler_stop_and_destroy(&sched_4w)
 
@@ -485,6 +524,7 @@ driver_verify_auto_backend_selection_and_overrides :: proc(
 	if actor.scheduler_init_workers(&sched_1w, 1, true) != .None {
 		return
 	}
+	actor.use_scheduler(prev_amb_auto)
 	actor.scheduler_start(&sched_1w)
 	defer actor.scheduler_stop_and_destroy(&sched_1w)
 
@@ -618,9 +658,12 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 	total_flushed_batches: u64,
 ) {
 	if !s.shared_sched_active {
+		prev_amb := actor.current_scheduler()
 		if actor.scheduler_init_workers(&s.shared_sched, 4, true) != .None {
+			actor.use_scheduler(prev_amb)
 			return 0, 0
 		}
+		actor.use_scheduler(prev_amb)
 		actor.scheduler_start(&s.shared_sched)
 		s.shared_sched_active = true
 	}
@@ -629,7 +672,9 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 	// initializing a `.Sleipnir_Actor` recorder with `scheduler = nil` creates its own
 	// dedicated `_owned_sched = true` scheduler without hijacking `&s.shared_sched`
 	// or clobbering `actor.current_scheduler()`.
+	prev_amb_cycle := actor.current_scheduler()
 	actor.use_scheduler(&s.shared_sched)
+	defer actor.use_scheduler(prev_amb_cycle)
 	{
 		iso_buf: [512]byte
 		iso_prefix := fmt.bprintf(iso_buf[:], "%s_ambient_iso", s.file_prefix)
@@ -1224,10 +1269,13 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 	defer driver_cleanup_segment_files(prefix_coop)
 
 	coop_sched: actor.Scheduler
+	prev_amb_coop := actor.current_scheduler()
 	if actor.scheduler_init_workers(&coop_sched, 1, true) != .None {
+		actor.use_scheduler(prev_amb_coop)
 		cross_recorder_leaks += 1
 		return
 	}
+	actor.use_scheduler(prev_amb_coop)
 	actor.scheduler_start(&coop_sched)
 	defer actor.scheduler_stop_and_destroy(&coop_sched)
 
@@ -1340,9 +1388,26 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 			}
 		}
 	}
+	// Verify `record_batch_reader_resolve` rejects a `Record_Batch` when `b.length > col.length`
+	// or when `col.buffers` is zeroed (`col.buffers[1].data == nil`).
+	oob_batch := oa.Record_Batch{
+		schema  = batches_c[0].schema,
+		columns = sliced_cols,
+		length  = 5, // `sliced_cols[i].length` is 4, so `5 > 4` is out of bounds!
+	}
+	if _, oob_ok := heimdall.record_batch_reader_resolve(&oob_batch); oob_ok {
+		cross_recorder_leaks += 1
+	}
+	sliced_cols[0].buffers = {}
+	if _, nil_buf_ok := heimdall.record_batch_reader_resolve(&sliced_batch); nil_buf_ok {
+		cross_recorder_leaks += 1
+	}
 
-	// Verify 64-ID TLS span batching across 2 interleaved recorders (`70 > SPAN_ID_BATCH_SIZE :: 64`)
-	// AND verify that re-initializing `rec_coop` at the exact same memory address resets `span_id` to 1.
+	// Verify 64-ID TLS span batching across 2 interleaved recorders (`70 > SPAN_ID_BATCH_SIZE :: 64`),
+	// verify that re-initializing `rec_coop` at the exact same memory address resets `span_id` to 1,
+	// verify that destroying `rec_coop` while a span is open on it does NOT clobber `tls_active_span_id`
+	// for another recorder (`rec_b`) on the same thread, and verify that > `MAX_TLS_RECORDERS` (16)
+	// concurrent active recorders on one thread degrade gracefully without clobbering slot 0.
 	{
 		buf_reinit: [512]byte
 		prefix_reinit := fmt.bprintf(buf_reinit[:], "%s_reinit_span", s.file_prefix)
@@ -1381,7 +1446,118 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 			cross_recorder_leaks += 1
 		}
 		heimdall.span_end(g_first)
-		heimdall.recorder_destroy(&rec_coop)
+
+		// Open a span on `rec_b` AND a span on `rec_coop`, then destroy `rec_coop` while its span is open:
+		// `rec_b`'s active span must remain intact in `tls_active_span_id`, and calling `span_end` on the
+		// stale `g_orphan` guard after `rec_coop` is destroyed (and even re-initialized at the same address)
+		// must NOT clobber `rec_b`'s active span!
+		if heimdall.recorder_init(&rec_b, heimdall.Config{
+			file_prefix      = prefix_b,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+		}) == nil {
+			g_b_live   := heimdall.span_begin(&rec_b, "surviving_lib", "live_span", 10)
+			g_orphan   := heimdall.span_begin(&rec_coop, "dying_lib", "orphan_span", 20)
+			heimdall.recorder_destroy(&rec_coop)
+			if heimdall.tls_active_span_id != g_b_live.span_id {
+				cross_recorder_leaks += 1
+			}
+			// Re-init `rec_coop` at the exact same address before `g_orphan` ends
+			if heimdall.recorder_init(&rec_coop, heimdall.Config{
+				file_prefix      = prefix_reinit,
+				batches_per_file = 1,
+				ring_page_count  = 2,
+			}) == nil {
+				g_reinit_live := heimdall.span_begin(&rec_coop, "reinit_lib", "new_gen_span", 30)
+				// Ending `g_orphan` from the old `_instance_id` must NOT touch `g_reinit_live`'s TLS slot!
+				heimdall.span_end(g_orphan)
+				if heimdall.tls_active_span_id != g_reinit_live.span_id {
+					cross_recorder_leaks += 1
+				}
+				heimdall.span_end(g_reinit_live)
+				if heimdall.tls_active_span_id != g_b_live.span_id {
+					cross_recorder_leaks += 1
+				}
+				heimdall.recorder_destroy(&rec_coop)
+			}
+			heimdall.span_end(g_b_live)
+			heimdall.recorder_destroy(&rec_b)
+			driver_cleanup_segment_files(prefix_b)
+			driver_cleanup_segment_files(prefix_reinit)
+		} else {
+			heimdall.recorder_destroy(&rec_coop)
+			cross_recorder_leaks += 1
+		}
+
+		// Open `MAX_TLS_RECORDERS + 1` (17) concurrent spans across distinct `(Recorder, actor_env)`
+		// slots on the same thread using a single initialized recorder and synthetic `actor.Context`
+		// envelopes (avoiding spawning 17 background threads inside the test), and verify slot 0
+		// (`many_guards[0]`) is never overwritten when slot acquisition saturates.
+		prev_user_ptr := context.user_ptr
+		fake_ctxs:   [heimdall.MAX_TLS_RECORDERS + 1]actor.Context
+		fake_envs:   [heimdall.MAX_TLS_RECORDERS + 1]u64
+		many_guards: [heimdall.MAX_TLS_RECORDERS + 1]heimdall.Span_Guard
+		m_buf: [512]byte
+		m_pfx := fmt.bprintf(m_buf[:], "%s_many_slots", s.file_prefix)
+		if heimdall.recorder_init(&rec_coop, heimdall.Config{
+			file_prefix      = m_pfx,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			policy           = .Drop,
+		}) == nil {
+			for m_idx in 0 ..< len(many_guards) {
+				fake_ctxs[m_idx] = actor.Context{current_env = &fake_envs[m_idx]}
+				context.user_ptr = &fake_ctxs[m_idx]
+				many_guards[m_idx] = heimdall.span_begin(&rec_coop, "many_lib", "slot_span", i64(m_idx))
+			}
+			if many_guards[heimdall.MAX_TLS_RECORDERS].tls_slot_idx != -1 {
+				cross_recorder_leaks += 1
+			}
+			for m_idx := len(many_guards) - 1; m_idx >= 0; m_idx -= 1 {
+				context.user_ptr = &fake_ctxs[m_idx]
+				if m_idx == 0 && heimdall.tls_active_span_id != many_guards[0].span_id {
+					cross_recorder_leaks += 1
+				}
+				heimdall.span_end(many_guards[m_idx])
+			}
+			context.user_ptr = prev_user_ptr
+			if heimdall.tls_active_span_id != 0 {
+				cross_recorder_leaks += 1
+			}
+			// Also verify out-of-order manual `span_end`: ending parent `g_parent` while child `g_child`
+			// is still active must NOT clobber `g_child`'s active TLS slot!
+			g_parent := heimdall.span_begin(&rec_coop, "ooo_lib", "parent_span", 100)
+			g_child  := heimdall.span_begin(&rec_coop, "ooo_lib", "child_span", 200)
+			heimdall.span_end(g_parent)
+			if heimdall.tls_active_span_id != g_child.span_id {
+				cross_recorder_leaks += 1
+			}
+			heimdall.span_end(g_child)
+
+			// Also verify 3 interleaved active `_instance_id`s on the same thread do NOT thrash `tls_span_id_cache`
+			// (each recorder's `span_id` increments sequentially by +1 on steps 1 and 2 instead of jumping by `SPAN_ID_BATCH_SIZE :: 64`).
+			orig_inst := rec_coop._instance_id
+			base_inst := (orig_inst + 16) & ~u64(15)
+			first_ids: [4]u64
+			for step in u64(0) ..< 3 {
+				for r_slot in u64(1) ..= 3 {
+					rec_coop._instance_id = base_inst + r_slot
+					g_seq := heimdall.span_begin(&rec_coop, "cache_lib", "seq_span", i64(step))
+					if step == 0 {
+						first_ids[r_slot] = g_seq.span_id
+					} else if g_seq.span_id != first_ids[r_slot] + step {
+						cross_recorder_leaks += 1
+					}
+					heimdall.span_end(g_seq)
+				}
+			}
+			rec_coop._instance_id = orig_inst
+
+			heimdall.recorder_destroy(&rec_coop)
+			driver_cleanup_segment_files(m_pfx)
+		} else {
+			cross_recorder_leaks += 1
+		}
 	}
 
 	return
@@ -1653,9 +1829,9 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 			fail_state.armed            = true
 			heimdall.recorder_flush(&rec)
 			fail_state.armed            = false
-			flushed, _ := heimdall.recorder_diagnostics(&rec)
+			flushed, dropped := heimdall.recorder_diagnostics(&rec)
 			heimdall.recorder_destroy(&rec)
-			partial_oom_clean = (fail_state.triggered_oom && flushed == 0)
+			partial_oom_clean = (fail_state.triggered_oom && flushed == 0 && dropped == 8)
 		}
 	}
 
@@ -1687,9 +1863,9 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 			heimdall.event_emit(&rec, "ovf_scope", "row_0", 1, .Ok)
 			heimdall.event_emit(&rec, "ovf_scope", huge_synthetic_str, 2, .Ok)
 			heimdall.recorder_flush(&rec)
-			flushed, _ := heimdall.recorder_diagnostics(&rec)
+			flushed, dropped := heimdall.recorder_diagnostics(&rec)
 			heimdall.recorder_destroy(&rec)
-			overflow_guard_clean = (flushed == 0)
+			overflow_guard_clean = (flushed == 0 && dropped == 2)
 		}
 	}
 
@@ -1718,6 +1894,96 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 			dyn_name  := fmt.bprintf(n_buf[:], "post_destroy_span")
 			heimdall.scoped_span(&rec, dyn_scope, dyn_name, 77)
 			heimdall.recorder_destroy(&rec)
+		} else {
+			overflow_guard_clean = false
+		}
+	}
+
+	// Part 4: Calling `recorder_flush` AFTER `recorder_set_enabled(&rec, false)` must still flush
+	// records emitted before disabling.
+	{
+		dis_prefix_buf: [512]byte
+		dis_prefix := fmt.bprintf(dis_prefix_buf[:], "%s_flush_after_disable", s.file_prefix)
+		defer driver_cleanup_segment_files(dis_prefix)
+
+		rec: heimdall.Recorder
+		if heimdall.recorder_init(
+			&rec,
+			heimdall.Config{
+				file_prefix      = dis_prefix,
+				batches_per_file = 1,
+				ring_page_count  = 2,
+				policy           = .Block,
+				backend          = .Dedicated_Thread,
+			},
+		) == nil {
+			heimdall.event_emit(&rec, "disable_flush", "captured_before_disable", 42, .Ok)
+			heimdall.recorder_set_enabled(&rec, false)
+			heimdall.event_emit(&rec, "disable_flush", "ignored_after_disable", 43, .Ok)
+			heimdall.recorder_flush(&rec)
+			flushed_before_destroy, _ := heimdall.recorder_diagnostics(&rec)
+			heimdall.recorder_destroy(&rec)
+			if flushed_before_destroy != 1 {
+				overflow_guard_clean = false
+			}
+		} else {
+			overflow_guard_clean = false
+		}
+	}
+
+	// Part 5: `decode_string_from_buffers` bounds-checks negative, inverted, or out-of-bounds offsets
+	// without panicking, and `clone_string_pair` OOM drops the record cleanly instead of staging blank strings.
+	{
+		sample_bytes := [4]u8{'o', 'k', '!', '!'}
+		bad_offsets  := [4]i32{-2, 2, 1, 99}
+		if heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 0) != "" ||
+		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 1) != "" ||
+		   heimdall.decode_string_from_buffers(raw_data(bad_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 2) != "" {
+			overflow_guard_clean = false
+		}
+		good_offsets := [2]i32{0, 2}
+		if heimdall.decode_string_from_buffers(raw_data(good_offsets[:]), raw_data(sample_bytes[:]), len(sample_bytes), 0) != "ok" {
+			overflow_guard_clean = false
+		}
+
+		// Also verify `record_batch_reader_resolve` rejects a `Record_Batch` with empty/malformed column buffers
+		empty_sc: oa.Schema
+		malformed_batch := oa.Record_Batch{
+			schema = &empty_sc,
+			length = 1,
+		}
+		if _, bad_resolve_ok := heimdall.record_batch_reader_resolve(&malformed_batch); bad_resolve_ok {
+			overflow_guard_clean = false
+		}
+
+		// Force `clone_string_pair` OOM by swapping `rec.allocator` to `mem.nil_allocator()` after init
+		oom_str_buf: [512]byte
+		oom_str_pfx := fmt.bprintf(oom_str_buf[:], "%s_clone_oom", s.file_prefix)
+		defer driver_cleanup_segment_files(oom_str_pfx)
+		rec_oom: heimdall.Recorder
+		if heimdall.recorder_init(&rec_oom, heimdall.Config{
+			file_prefix          = oom_str_pfx,
+			batches_per_file     = 1,
+			ring_page_count      = 2,
+			string_fallback_copy = true,
+			policy               = .Drop,
+			backend              = .Sleipnir_Actor,
+		}) == nil {
+			orig_alloc := rec_oom.allocator
+			rec_oom.allocator = mem.nil_allocator()
+			s_buf: [32]byte
+			n_buf: [32]byte
+			dyn_s := fmt.bprintf(s_buf[:], "dyn_oom_scope")
+			dyn_n := fmt.bprintf(n_buf[:], "dyn_oom_name")
+			g_oom := heimdall.span_begin(&rec_oom, dyn_s, dyn_n, 1)
+			heimdall.span_end(g_oom)
+			heimdall.event_emit(&rec_oom, dyn_s, dyn_n, 2, .Ok)
+			rec_oom.allocator = orig_alloc
+			_, oom_drops := heimdall.recorder_diagnostics(&rec_oom)
+			heimdall.recorder_destroy(&rec_oom)
+			if oom_drops != 2 || heimdall.tls_active_span_id != 0 {
+				overflow_guard_clean = false
+			}
 		} else {
 			overflow_guard_clean = false
 		}
@@ -1755,7 +2021,10 @@ then_defined_step :: proc(s: ^Suite_Ctx, val: int) {
 		&diags,
 		context.temp_allocator,
 	)
-	unknown_dsl_rejected = (!gen_ok && len(diags) > 0)
+	dir_diags := make([dynamic]codegen.Codegen_Diagnostic)
+	defer codegen.destroy_diagnostics(&dir_diags)
+	_, empty_dir_ok := codegen.generate_atdd_directory("heimdall", "dsl_atdd_gen.odin", &dir_diags)
+	unknown_dsl_rejected = (!gen_ok && len(diags) > 0 && !empty_dir_ok && len(dir_diags) > 0)
 
 	// 2. Polymorphic `$T` and variadic `..` DSL steps with named `loc = #caller_location`,
 	//    plus token-boundary import filtering (`uptime_ns: int = 0` must NOT retain unused `import "core:time"`).

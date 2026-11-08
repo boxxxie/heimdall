@@ -18,6 +18,7 @@ package main
 import codegen "../../heimdall/codegen"
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 
 print_and_exit_on_diagnostics :: proc(diags: ^[dynamic]codegen.Codegen_Diagnostic) {
 	for d in diags^ {
@@ -52,7 +53,8 @@ main :: proc() {
 		delete(schema_out)
 	}
 
-	for target_dir in args {
+	for raw_target in args {
+		target_dir, _ := filepath.clean(raw_target, context.temp_allocator)
 		if target_dir == "heimdall" {
 			continue
 		}

@@ -486,7 +486,7 @@ is_scenario_ctx_arg :: proc(expr: ^ast.Expr, scenario_var_name: string) -> bool 
 	}
 	#partial switch e in target.derived {
 	case ^ast.Ident:
-		return e.name == "s" || (len(scenario_var_name) > 0 && e.name == scenario_var_name)
+		return len(scenario_var_name) > 0 && e.name == scenario_var_name
 	case ^ast.Call_Expr:
 		if fn_id, ok := e.expr.derived.(^ast.Ident); ok {
 			return fn_id.name == "current_scenario"
@@ -626,6 +626,29 @@ count_do_statements_in_file :: proc(file: ^ast.File, report: ^AST_Contract_Repor
 }
 
 @(private)
+extract_proc_scenario_param_name :: proc(src: string, proc_lit: ^ast.Proc_Lit) -> string {
+	if proc_lit == nil || proc_lit.type == nil || proc_lit.type.params == nil {
+		return ""
+	}
+	for field in proc_lit.type.params.list {
+		ctx_type, ptr_ok := extract_pointer_ident(field.type)
+		is_scenario_type := (ptr_ok && ctx_type == "Suite_Ctx")
+		if !is_scenario_type && field.type != nil {
+			if id, id_ok := field.type.derived.(^ast.Ident); id_ok && (id.name == "Scenario_Handle" || id.name == "Suite_Ctx") {
+				is_scenario_type = true
+			}
+		}
+		if is_scenario_type && len(field.names) > 0 {
+			name := node_source(src, field.names[0])
+			if name != "_" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+@(private)
 analyze_spec_ast :: proc(
 	file:   ^ast.File,
 	report: ^AST_Contract_Report,
@@ -642,7 +665,7 @@ analyze_spec_ast :: proc(
 				report            = report,
 				called            = called,
 				in_spec_proc      = true,
-				scenario_var_name = "s",
+				scenario_var_name = "",
 			}
 			v := ast.Visitor{
 				visit = ast_visit_node,
@@ -659,6 +682,7 @@ analyze_spec_ast :: proc(
 				ast.walk(&v, decl_stmt)
 				continue
 			}
+			walk_ctx.scenario_var_name = extract_proc_scenario_param_name(file.src, proc_lit)
 			_, _, has_test := get_decl_attribute(d, "test")
 			if !has_test {
 				report.non_test_procs_in_spec += 1
@@ -1022,15 +1046,9 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 	fmt.sbprintln(&sb, "// Ambient Scenario Context & `@(deferred_out)` Scoped RAII Harness")
 	fmt.sbprintln(&sb, "// =============================================================================")
 	fmt.sbprintln(&sb)
-	fmt.sbprintln(&sb, "MAX_SCENARIO_DEPTH :: 4")
-	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "@(private)")
 	fmt.sbprintln(&sb, "@(thread_local)")
-	fmt.sbprintln(&sb, "_scenario_stack: [MAX_SCENARIO_DEPTH]Suite_Ctx")
-	fmt.sbprintln(&sb)
-	fmt.sbprintln(&sb, "@(private)")
-	fmt.sbprintln(&sb, "@(thread_local)")
-	fmt.sbprintln(&sb, "_scenario_depth: int")
+	fmt.sbprintln(&sb, "_scenario_instance: Suite_Ctx")
 	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "@(private)")
 	fmt.sbprintln(&sb, "@(thread_local)")
@@ -1044,28 +1062,23 @@ emit_atdd_module_code :: proc(mod: ^ATDD_Module, allocator := context.allocator)
 	fmt.sbprintln(&sb, "Scenario_Handle :: struct {")
 	fmt.sbprintln(&sb, "\tusing ctx:    ^Suite_Ctx,")
 	fmt.sbprintln(&sb, "\tusing vtable: ^Suite_Ctx_VTable,")
-	fmt.sbprintln(&sb, "\tprev_ctx:     ^Suite_Ctx,")
 	fmt.sbprintln(&sb, "}")
 	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "@(deferred_out = scenario_scope_end)")
 	fmt.sbprintln(&sb, "scenario :: proc(t: ^testing.T, loc := #caller_location) -> Scenario_Handle {")
 	fmt.sbprintln(&sb, "\tassert(_active_scenario_ctx == nil, \"Active ATDD scenario already running in this scope; wrap sequential scenarios in { } blocks\", loc)")
-	fmt.sbprintln(&sb, "\tassert(_scenario_depth < MAX_SCENARIO_DEPTH, \"MAX_SCENARIO_DEPTH exceeded; wrap sequential scenarios in { } blocks\", loc)")
-	fmt.sbprintln(&sb, "\ts := &_scenario_stack[_scenario_depth]")
-	fmt.sbprintln(&sb, "\t_scenario_depth += 1")
+	fmt.sbprintln(&sb, "\ts := &_scenario_instance")
 	fmt.sbprintln(&sb, "\ts^ = {}")
 	fmt.sbprintln(&sb, "\tdriver_init(s, t)")
-	fmt.sbprintln(&sb, "\tprev := _active_scenario_ctx")
 	fmt.sbprintln(&sb, "\t_active_scenario_ctx = s")
-	fmt.sbprintln(&sb, "\treturn Scenario_Handle{ctx = s, vtable = &_suite_ctx_vtable, prev_ctx = prev}")
+	fmt.sbprintln(&sb, "\treturn Scenario_Handle{ctx = s, vtable = &_suite_ctx_vtable}")
 	fmt.sbprintln(&sb, "}")
 	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "scenario_scope_end :: proc(h: Scenario_Handle) {")
-	fmt.sbprintln(&sb, "\t_active_scenario_ctx = h.prev_ctx")
+	fmt.sbprintln(&sb, "\t_active_scenario_ctx = nil")
 	fmt.sbprintln(&sb, "\tif h.ctx != nil {")
 	fmt.sbprintln(&sb, "\t\tdriver_destroy(h.ctx)")
 	fmt.sbprintln(&sb, "\t\th.ctx^ = {}")
-	fmt.sbprintln(&sb, "\t\t_scenario_depth -= 1")
 	fmt.sbprintln(&sb, "\t}")
 	fmt.sbprintln(&sb, "}")
 	fmt.sbprintln(&sb)
@@ -1272,6 +1285,11 @@ generate_atdd_directory :: proc(
 	}
 	slice.sort(dsl_files[:])
 	slice.sort(spec_files[:])
+
+	if len(dsl_files) == 0 {
+		append_diagnostic(diagnostics, dir_path, 1, 1, "no dsl_*.odin files found in ATDD test directory")
+		return "", false
+	}
 
 	mod: ATDD_Module
 	init_atdd_module(&mod)

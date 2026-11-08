@@ -706,7 +706,11 @@ spec_failed_arrow_file_write_frees_batches_without_incrementing_flushed_segments
 	upon.simulating_http_requests(count = 1250, payload_step_bytes = 8)
 	upon.flushing_and_shutting_down_recorder(flush_first = true)
 
-	then.recorder_diagnostics_are(expected_flushed_segments = 0, expected_dropped_records = 0)
+	then.recorder_diagnostics_are(
+		expected_flushed_segments = 0,
+		expected_dropped_records  = 0,
+		expected_failed_segments  = 2,
+	)
 }
 
 @(test)

@@ -257,10 +257,14 @@ then_recorder_diagnostics_are :: proc(
 	s:                        ^Suite_Ctx,
 	expected_flushed_segments: u64,
 	expected_dropped_records:  u64,
+	expected_failed_segments:  Maybe(u64) = nil,
 	loc := #caller_location,
 ) {
 	testing.expect_value(s.t, s.last_flushed_batches, expected_flushed_segments, loc = loc)
 	testing.expect_value(s.t, s.last_dropped_records, expected_dropped_records,  loc = loc)
+	if exp_failed, has_failed := expected_failed_segments.?; has_failed {
+		testing.expect_value(s.t, heimdall.recorder_failed_segments(&s.rec), exp_failed, loc = loc)
+	}
 }
 
 then_drop_backpressure_conserves_total_records :: proc(
