@@ -801,6 +801,7 @@ Span_Guard :: struct {
 	prev_attr:            i64,
 	scope:                string,
 	name:                 string,
+	clone_alloc:          mem.Allocator,
 	attr_i64:             i64,
 	status:               Status,
 	prev_status:          Status,
@@ -856,9 +857,10 @@ span_begin :: #force_inline proc(
 
 	stored_scope := scope
 	stored_name  := name
+	clone_alloc: mem.Allocator
 	cloned       := false
 	if r.cfg.string_fallback_copy {
-		var_s, var_n, clone_ok := clone_string_pair(r, scope, name)
+		var_s, var_n, var_alloc, clone_ok := clone_string_pair(r, scope, name)
 		if !clone_ok {
 			if slot != nil {
 				if parent == 0 {
@@ -890,6 +892,7 @@ span_begin :: #force_inline proc(
 		}
 		stored_scope = var_s
 		stored_name  = var_n
+		clone_alloc  = var_alloc
 		cloned       = true
 	}
 
@@ -902,6 +905,7 @@ span_begin :: #force_inline proc(
 		prev_attr            = prev_attr,
 		scope                = stored_scope,
 		name                 = stored_name,
+		clone_alloc          = clone_alloc,
 		attr_i64             = attr_i64,
 		status               = .Ok,
 		prev_status          = prev_status,
@@ -1001,8 +1005,8 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	}
 
 	if cur_inst != g.recorder_id {
-		if g.strings_cloned && cur_inst == 0 {
-			free_cloned_pair(g.recorder, g.scope, g.name)
+		if g.strings_cloned && (cur_inst == 0 || g.clone_alloc == g.recorder.allocator) {
+			free_cloned_pair(g.recorder, g.scope, g.name, g.clone_alloc)
 		}
 		return
 	}
@@ -1022,6 +1026,7 @@ span_end :: #force_inline proc(g: Span_Guard) {
 		final_attr,
 		g.strings_cloned,
 		g.recorder_id,
+		g.clone_alloc,
 	)
 }
 
@@ -1112,18 +1117,19 @@ recorder_locked_allocator :: #force_inline proc(r: ^Recorder) -> mem.Allocator {
 }
 
 @(private)
-clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s, n: string, ok: bool) {
+clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s, n: string, used_alloc: mem.Allocator, ok: bool) {
 	s_len := len(scope)
 	n_len := len(name)
 	total := s_len + n_len
 	if total <= 0 {
-		return "", "", true
+		return "", "", r.allocator, true
 	}
 	sync.mutex_lock(&r._alloc_mu)
-	buf, err := mem.alloc_bytes_non_zeroed(total, 1, r.allocator)
+	used_alloc = r.allocator
+	buf, err := mem.alloc_bytes_non_zeroed(total, 1, used_alloc)
 	sync.mutex_unlock(&r._alloc_mu)
 	if err != nil || buf == nil {
-		return "", "", false
+		return "", "", {}, false
 	}
 	ptr := raw_data(buf)
 	if s_len > 0 {
@@ -1134,11 +1140,11 @@ clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s
 		mem.copy_non_overlapping(rawptr(uintptr(ptr) + uintptr(s_len)), raw_data(name), n_len)
 		n = string(buf[s_len:total])
 	}
-	return s, n, true
+	return s, n, used_alloc, true
 }
 
 @(private)
-free_cloned_pair :: #force_inline proc(r: ^Recorder, scope, name: string) {
+free_cloned_pair :: #force_inline proc(r: ^Recorder, scope, name: string, explicit_alloc: mem.Allocator = {}) {
 	s_len := len(scope)
 	n_len := len(name)
 	total := s_len + n_len
@@ -1147,7 +1153,8 @@ free_cloned_pair :: #force_inline proc(r: ^Recorder, scope, name: string) {
 	}
 	base := raw_data(scope) if s_len > 0 else raw_data(name)
 	sync.mutex_lock(&r._alloc_mu)
-	_ = mem.free_with_size(base, total, r.allocator)
+	target_alloc := explicit_alloc if explicit_alloc.procedure != nil else r.allocator
+	_ = mem.free_with_size(base, total, target_alloc)
 	sync.mutex_unlock(&r._alloc_mu)
 }
 
@@ -1192,28 +1199,32 @@ record_raw :: #force_inline proc(
 	name:                 string,
 	value_f64:            f64,
 	attr_i64:             i64,
-	already_cloned:       bool = false,
-	expected_instance_id: u64  = 0,
+	already_cloned:       bool          = false,
+	expected_instance_id: u64           = 0,
+	clone_alloc:          mem.Allocator = {},
 ) {
 	stored_scope := scope
 	stored_name  := name
 	owns_strings := already_cloned
+	used_alloc   := clone_alloc
 
 	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) {
-		if owns_strings && (expected_instance_id == 0 || intrinsics.atomic_load_explicit(&r._instance_id, .Acquire) == 0 || intrinsics.atomic_load_explicit(&r._instance_id, .Acquire) == expected_instance_id) {
-			free_cloned_pair(r, stored_scope, stored_name)
+		cur := intrinsics.atomic_load_explicit(&r._instance_id, .Acquire)
+		if owns_strings && (expected_instance_id == 0 || cur == 0 || cur == expected_instance_id || used_alloc == r.allocator) {
+			free_cloned_pair(r, stored_scope, stored_name, used_alloc)
 		}
 		return
 	}
 
 	if r.cfg.string_fallback_copy && !already_cloned {
-		var_s, var_n, clone_ok := clone_string_pair(r, scope, name)
+		var_s, var_n, var_alloc, clone_ok := clone_string_pair(r, scope, name)
 		if !clone_ok {
 			_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
 			return
 		}
 		stored_scope = var_s
 		stored_name  = var_n
+		used_alloc   = var_alloc
 		owns_strings = true
 	}
 
@@ -1221,10 +1232,10 @@ record_raw :: #force_inline proc(
 
 	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) ||
 	   (expected_instance_id != 0 && r._instance_id != expected_instance_id) {
-		can_free := owns_strings && (expected_instance_id == 0 || r._instance_id == 0 || r._instance_id == expected_instance_id)
+		can_free := owns_strings && (expected_instance_id == 0 || r._instance_id == 0 || r._instance_id == expected_instance_id || used_alloc == r.allocator)
 		sync.mutex_unlock(&r._mu)
 		if can_free {
-			free_cloned_pair(r, stored_scope, stored_name)
+			free_cloned_pair(r, stored_scope, stored_name, used_alloc)
 		}
 		return
 	}
@@ -1233,7 +1244,7 @@ record_raw :: #force_inline proc(
 		if !acquire_free_page_locked(r) {
 			sync.mutex_unlock(&r._mu)
 			if owns_strings {
-				free_cloned_pair(r, stored_scope, stored_name)
+				free_cloned_pair(r, stored_scope, stored_name, used_alloc)
 			}
 			_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
 			return

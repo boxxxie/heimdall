@@ -161,13 +161,17 @@ worker_actor_receive :: proc(ctx: ^actor.Context, state: ^Worker_State, msg: ^in
 	heimdall.scoped_span(state.rec, "net.http", "handle_request", i64(msg^))
 	heimdall.counter_add(state.rec, "net.http", "requests_total", 1.0, i64(msg^))
 }
+
+shadowed_param_helper :: proc(rec: ^heimdall.Recorder, SCOPE_HTTP: string) {
+	heimdall.event_emit(rec, SCOPE_HTTP, "named_verify", 1)
+}
 `
 	then.ast_analyzes_telemetry_call_sites(
 		instrumented_src         = instrumented_app_src,
-		expected_total_calls     = 14,
+		expected_total_calls     = 15,
 		expected_unique_scopes   = 3, // "auth.jwt", "db.sql", "net.http"
 		expected_unique_names    = 9, // "handle_request", "misplaced_before_break", "misplaced_before_return", "misplaced_case_span", "misplaced_defer_span", "misplaced_if_span", "misplaced_tail_span", "named_verify", "requests_total"
-		expected_dynamic_hazards = 2, // fmt.tprintf("user_%d", user_id) + shadowed local `METRIC_REQ := fmt.tprintf(...)`
+		expected_dynamic_hazards = 3, // fmt.tprintf("user_%d", user_id) + shadowed local `METRIC_REQ := fmt.tprintf(...)` + shadowed param `SCOPE_HTTP: string`
 		expected_misplaced_spans = 6, // sole stmt in `if` + before `return` + `switch` `case` + before `break` + `defer scoped_span` + last stmt in proc body
 		expected_actor_calls     = 2, // 2 calls inside `worker_actor_receive(ctx: ^actor.Context, ...)`
 	)

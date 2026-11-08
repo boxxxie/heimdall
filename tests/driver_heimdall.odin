@@ -1442,8 +1442,15 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 			batches_per_file = 1,
 			ring_page_count  = 2,
 		}) == nil {
-			g_b_live   := heimdall.span_begin(&rec_b, "surviving_lib", "live_span", 10)
-			g_orphan   := heimdall.span_begin(&rec_coop, "dying_lib", "orphan_span", 20)
+			g_b_live := heimdall.span_begin(&rec_b, "surviving_lib", "live_span", 10)
+			// Flush `rec_coop`'s static `g_first` row first, then enable `string_fallback_copy` on `rec_coop`
+			// before starting `g_orphan` so `g_orphan` clones dynamic strings; when `rec_coop` is destroyed
+			// and re-initialized at the same address with `string_fallback_copy = false`, `span_end(g_orphan)`
+			// must free its cloned strings cleanly via `g.clone_alloc` without leaking or emitting a phantom record!
+			heimdall.recorder_flush(&rec_coop)
+			driver_cleanup_segment_files(prefix_reinit)
+			rec_coop.cfg.string_fallback_copy = true
+			g_orphan := heimdall.span_begin(&rec_coop, "dying_lib", "orphan_span", 20)
 			heimdall.recorder_destroy(&rec_coop)
 			if heimdall.tls_active_span_id != g_b_live.span_id {
 				cross_recorder_leaks += 1
@@ -2064,9 +2071,10 @@ spec_uses_poly_and_variadic :: proc(t: ^testing.T) {
 		strings.contains(poly_code, "..tags, loc = loc") &&
 		!strings.contains(poly_code, `"core:time"`)
 
-	// 3. Custom `@(telemetry_schema)` struct codegen
+	// 3. Custom `@(telemetry_schema)` struct codegen (including custom `import oa "odinarrow"` preservation)
 	custom_schema_src :: `
 package custom_telemetry
+import oa "odinarrow"
 State_Kind :: enum u8 { Idle = 0, Active = 1 }
 @(telemetry_schema)
 Custom_Tick :: struct {
@@ -2082,6 +2090,7 @@ Custom_Tick :: struct {
 		context.temp_allocator,
 	)
 	if schema_ok &&
+		strings.contains(schema_code, `import oa "odinarrow"`) &&
 		strings.contains(schema_code, "RECORD_COLUMN_COUNT :: 4") &&
 		strings.contains(schema_code, "Custom_Tick") &&
 		strings.contains(schema_code, "tick_ns_data: [^]i64") &&
