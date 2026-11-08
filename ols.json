@@ -11,5 +11,5 @@
 	"enable_semantic_tokens": true,
 	"enable_inlay_hints": true,
 	"enable_checker_only_saved": true,
-	"checker_args": "-vet -strict-style -vet-tabs -disallow-do -vet-packages:heimdall,heimdall_codegen,heimdall_tests,heimdall_benchmarks"
+	"checker_args": "-vet -strict-style -vet-tabs -disallow-do -custom-attribute:telemetry_schema -vet-packages:heimdall,heimdall_codegen,heimdall_tests,heimdall_benchmarks"
 }

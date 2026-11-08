@@ -22,8 +22,8 @@ when ODIN_OS == .Linux {
 
 	@(private)
 	Posix_Timespec :: struct {
-		tv_sec:  i64,
-		tv_nsec: i64,
+		tv_sec:  c.long,
+		tv_nsec: c.long,
 	}
 
 	@(default_calling_convention = "c")
@@ -36,14 +36,14 @@ when ODIN_OS == .Linux {
 	monotonic_now_ns :: #force_inline proc() -> i64 {
 		ts: Posix_Timespec
 		clock_gettime(CLOCK_MONOTONIC, &ts)
-		return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+		return i64(ts.tv_sec) * 1_000_000_000 + i64(ts.tv_nsec)
 	}
 
 	@(private)
 	realtime_now_ns :: #force_inline proc() -> i64 {
 		ts: Posix_Timespec
 		clock_gettime(CLOCK_REALTIME, &ts)
-		return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+		return i64(ts.tv_sec) * 1_000_000_000 + i64(ts.tv_nsec)
 	}
 } else {
 	@(private)
@@ -100,6 +100,7 @@ Config :: struct {
 // Canonical telemetry row stored in #soa layout inside each staging page.
 // Parsed by `tools/heimdall_gen` (`core:odin/parser`) to generate `heimdall/schema_gen.odin`
 // (`make_record_arrow_schema`, `stage_record_into_soa`, `build_arrow_batch`, and `Record_Batch_Reader`).
+@(telemetry_schema)
 Record :: struct {
 	timestamp_ns: i64,
 	duration_ns:  i64,
@@ -115,7 +116,7 @@ Record :: struct {
 }
 
 @(private)
-Staging_Page :: struct {
+Staging_Page :: struct #align(64) {
 	rows:      #soa[]Record,
 	count:     int,
 	_pad:      [64]u8,
@@ -137,8 +138,8 @@ Flusher_Msg :: struct {
 
 @(private)
 Flusher_Engine :: struct {
-	// 100% single-actor (or single-worker-thread) owned — no mutex needed!
 	r:               ^Recorder,
+	mu:              sync.Mutex,
 	pool:            oa.Buffer_Pool,
 	schema:          oa.Schema,
 	segment_batches: [dynamic]oa.Record_Batch,
@@ -181,11 +182,15 @@ Recorder :: struct #align(64) {
 	_cv_actor_idle:        sync.Cond,
 	_alloc_mu:             sync.Mutex,
 
-	// Zone 3: Atomic counters & background execution backend (cache-line isolated)
+	// Zone 3: Producer-written atomic counters (cache-line isolated)
 	_pad1:             [64]u8,
 	_next_span_id:     u64,
 	_dropped_records:  u64,
+
+	// Zone 4: Worker-owned counters & background execution backend (cache-line isolated)
+	_pad2:             [64]u8,
 	_flushed_segments: u64,
+	_failed_segments:  u64,
 	_eng:              Flusher_Engine,
 	_worker:           ^thread.Thread,
 	_sched:            ^actor.Scheduler,
@@ -202,6 +207,7 @@ tls_active_span_id: u64
 @(private)
 TLS_Recorder_Span :: struct {
 	recorder:        ^Recorder,
+	recorder_id:     u64,
 	actor_env:       rawptr,
 	span_id:         u64,
 	attr_i64:        i64,
@@ -226,7 +232,7 @@ TLS_Span_ID_Cache :: struct {
 
 @(private)
 @(thread_local)
-tls_span_id_cache: [2]TLS_Span_ID_Cache
+tls_span_id_cache: [MAX_TLS_RECORDERS]TLS_Span_ID_Cache
 
 @(private)
 g_next_recorder_instance_id: u64
@@ -256,20 +262,16 @@ current_actor_env :: #force_inline proc() -> rawptr {
 
 @(private)
 next_span_id :: #force_inline proc(r: ^Recorder) -> u64 {
-	inst := r._instance_id
-	if tls_span_id_cache[0].instance_id == inst && tls_span_id_cache[0].next_id < tls_span_id_cache[0].limit_id {
-		id := tls_span_id_cache[0].next_id
-		tls_span_id_cache[0].next_id = id + 1
-		return id
-	}
-	if tls_span_id_cache[1].instance_id == inst && tls_span_id_cache[1].next_id < tls_span_id_cache[1].limit_id {
-		id := tls_span_id_cache[1].next_id
-		tls_span_id_cache[1].next_id = id + 1
+	inst  := r._instance_id
+	idx   := inst & (MAX_TLS_RECORDERS - 1)
+	entry := &tls_span_id_cache[idx]
+	if entry.instance_id == inst && entry.next_id < entry.limit_id {
+		id := entry.next_id
+		entry.next_id = id + 1
 		return id
 	}
 	base := intrinsics.atomic_add_explicit(&r._next_span_id, SPAN_ID_BATCH_SIZE, .Relaxed)
-	tls_span_id_cache[1] = tls_span_id_cache[0]
-	tls_span_id_cache[0] = TLS_Span_ID_Cache{
+	entry^ = TLS_Span_ID_Cache{
 		instance_id = inst,
 		next_id     = base + 1,
 		limit_id    = base + SPAN_ID_BATCH_SIZE,
@@ -279,17 +281,18 @@ next_span_id :: #force_inline proc(r: ^Recorder) -> u64 {
 
 @(private)
 tls_acquire_recorder_slot :: #force_inline proc(r: ^Recorder, env: rawptr) -> (slot: ^TLS_Recorder_Span, slot_idx: i8) {
+	inst := r._instance_id
 	if tls_active_span_id == 0 {
-		tls_recorder_spans[0] = TLS_Recorder_Span{recorder = r, actor_env = env}
+		tls_recorder_spans[0] = TLS_Recorder_Span{recorder = r, recorder_id = inst, actor_env = env}
 		return &tls_recorder_spans[0], 0
 	}
-	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].actor_env == env {
+	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].recorder_id == inst && tls_recorder_spans[0].actor_env == env {
 		return &tls_recorder_spans[0], 0
 	}
 	free_idx := 0
 	found_free := tls_recorder_spans[0].recorder == nil || tls_recorder_spans[0].span_id == 0
 	for i in 1 ..< MAX_TLS_RECORDERS {
-		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].actor_env == env {
+		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].recorder_id == inst && tls_recorder_spans[i].actor_env == env {
 			return &tls_recorder_spans[i], i8(i)
 		}
 		if !found_free && (tls_recorder_spans[i].recorder == nil || tls_recorder_spans[i].span_id == 0) {
@@ -297,7 +300,10 @@ tls_acquire_recorder_slot :: #force_inline proc(r: ^Recorder, env: rawptr) -> (s
 			found_free = true
 		}
 	}
-	tls_recorder_spans[free_idx] = TLS_Recorder_Span{recorder = r, actor_env = env}
+	if !found_free {
+		return nil, -1
+	}
+	tls_recorder_spans[free_idx] = TLS_Recorder_Span{recorder = r, recorder_id = inst, actor_env = env}
 	return &tls_recorder_spans[free_idx], i8(free_idx)
 }
 
@@ -306,12 +312,13 @@ tls_find_recorder_slot :: #force_inline proc(r: ^Recorder) -> ^TLS_Recorder_Span
 	if tls_active_span_id == 0 {
 		return nil
 	}
-	env := current_actor_env()
-	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].actor_env == env {
+	inst := r._instance_id
+	env  := current_actor_env()
+	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].recorder_id == inst && tls_recorder_spans[0].actor_env == env {
 		return &tls_recorder_spans[0]
 	}
 	for i in 1 ..< MAX_TLS_RECORDERS {
-		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].actor_env == env {
+		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].recorder_id == inst && tls_recorder_spans[i].actor_env == env {
 			return &tls_recorder_spans[i]
 		}
 	}
@@ -323,12 +330,13 @@ tls_active_span_for_recorder :: #force_inline proc(r: ^Recorder) -> u64 {
 	if tls_active_span_id == 0 {
 		return 0
 	}
-	env := current_actor_env()
-	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].actor_env == env {
+	inst := r._instance_id
+	env  := current_actor_env()
+	if tls_recorder_spans[0].recorder == r && tls_recorder_spans[0].recorder_id == inst && tls_recorder_spans[0].actor_env == env {
 		return tls_recorder_spans[0].span_id
 	}
 	for i in 1 ..< MAX_TLS_RECORDERS {
-		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].actor_env == env {
+		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].recorder_id == inst && tls_recorder_spans[i].actor_env == env {
 			return tls_recorder_spans[i].span_id
 		}
 	}
@@ -515,17 +523,25 @@ recorder_destroy :: proc(r: ^Recorder) {
 		return
 	}
 
+	inst := r._instance_id
 	for i in 0 ..< MAX_TLS_RECORDERS {
-		if tls_recorder_spans[i].recorder == r {
+		if tls_recorder_spans[i].recorder == r && tls_recorder_spans[i].recorder_id == inst {
 			if tls_recorder_spans[i].span_id != 0 {
 				tls_active_recorder_count = max(tls_active_recorder_count - 1, 0)
-			}
-			if tls_active_span_id == tls_recorder_spans[i].span_id {
-				tls_active_span_id = 0
 			}
 			tls_recorder_spans[i] = {}
 		}
 	}
+	active_id: u64 = 0
+	if tls_active_recorder_count > 0 {
+		for i in 0 ..< MAX_TLS_RECORDERS {
+			if tls_recorder_spans[i].span_id != 0 {
+				active_id = tls_recorder_spans[i].span_id
+				break
+			}
+		}
+	}
+	tls_active_span_id = active_id
 
 	sync.mutex_lock(&r._mu)
 	intrinsics.atomic_store_explicit(&r.enabled, false, .Release)
@@ -577,6 +593,7 @@ recorder_destroy :: proc(r: ^Recorder) {
 
 	dropped := intrinsics.atomic_load_explicit(&r._dropped_records, .Acquire)
 	flushed := intrinsics.atomic_load_explicit(&r._flushed_segments, .Acquire)
+	failed  := intrinsics.atomic_load_explicit(&r._failed_segments, .Acquire)
 
 	alloc      := r.allocator
 	page_alloc := r._page_alloc
@@ -599,6 +616,7 @@ recorder_destroy :: proc(r: ^Recorder) {
 	r._page_alloc       = page_alloc
 	r._dropped_records  = dropped
 	r._flushed_segments = flushed
+	r._failed_segments  = failed
 }
 
 // Returns the number of flushed `.arrow` segment files and dropped telemetry records.
@@ -608,6 +626,14 @@ recorder_diagnostics :: #force_inline proc(r: ^Recorder) -> (flushed_segments, d
 	}
 	return intrinsics.atomic_load_explicit(&r._flushed_segments, .Acquire),
 	       intrinsics.atomic_load_explicit(&r._dropped_records, .Acquire)
+}
+
+// Returns the number of failed Arrow segment file writes.
+recorder_failed_segments :: #force_inline proc(r: ^Recorder) -> u64 {
+	if r == nil {
+		return 0
+	}
+	return intrinsics.atomic_load_explicit(&r._failed_segments, .Acquire)
 }
 
 // Returns whether the recorder is currently enabled.
@@ -631,13 +657,13 @@ recorder_set_enabled :: proc(r: ^Recorder, enabled: bool) {
 	sync.mutex_unlock(&r._mu)
 }
 
-// Returns true when all `#soa` ring pages are full and queued for the background flusher.
+// Returns true when no `#soa` ring pages are available to producers.
 recorder_is_saturated :: proc(r: ^Recorder) -> bool {
 	if r == nil || r._pages == nil {
 		return false
 	}
 	sync.mutex_lock(&r._mu)
-	saturated := (r._free_top == 0 && r._active_page_idx == -1 && r._ready_count == r.cfg.ring_page_count)
+	saturated := (r._free_top == 0 && r._active_page_idx == -1)
 	sync.mutex_unlock(&r._mu)
 	return saturated
 }
@@ -655,18 +681,20 @@ recorder_waiting_producers :: proc(r: ^Recorder) -> int {
 
 // Forces the current partial page and any buffered Arrow batches to disk immediately.
 recorder_flush :: proc(r: ^Recorder) {
-	if r == nil || !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) {
+	if r == nil || r._pages == nil {
 		return
 	}
 	if r.cfg.backend == .Sleipnir_Actor {
 		sync.mutex_lock(&r._mu)
-		if r._shutdown || !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) {
+		if r._shutdown || r._pages == nil {
 			sync.mutex_unlock(&r._mu)
 			return
 		}
 		if r._active_page_idx >= 0 && r._pages[r._active_page_idx].count > 0 {
-			rotate_active_page_locked(r)
+			rotate_active_page_locked(r, false)
 		}
+		r._flush_target_gen += 1
+		r._flush_requested = true
 		flusher  := r._flusher_actor
 		sched    := r._sched
 		can_call := flusher != nil && sched != nil && sched.started && intrinsics.atomic_load_explicit(&sched.running, .Acquire)
@@ -691,9 +719,12 @@ recorder_flush :: proc(r: ^Recorder) {
 
 	sync.mutex_lock(&r._mu)
 	defer sync.mutex_unlock(&r._mu)
+	if r._shutdown || r._pages == nil {
+		return
+	}
 
 	if r._active_page_idx >= 0 && r._pages[r._active_page_idx].count > 0 {
-		rotate_active_page_locked(r)
+		rotate_active_page_locked(r, false)
 	}
 	r._flush_target_gen += 1
 	target_gen := r._flush_target_gen
@@ -730,6 +761,7 @@ recorder_set_worker_paused :: proc(r: ^Recorder, paused: bool) {
 
 Span_Guard :: struct {
 	recorder:             ^Recorder,
+	recorder_id:          u64,
 	start_mono_ns:        i64,
 	span_id:              u64,
 	prev_parent:          u64,
@@ -768,30 +800,69 @@ span_begin :: #force_inline proc(
 	id             := next_span_id(r)
 	slot, slot_idx := tls_acquire_recorder_slot(r, current_actor_env())
 
-	parent               := slot.span_id
-	prev_status          := slot.status
-	prev_attr            := slot.attr_i64
-	prev_attr_overridden := slot.attr_overridden
+	parent:               u64
+	prev_status:          Status
+	prev_attr:            i64
+	prev_attr_overridden: bool
 
-	if parent == 0 {
-		tls_active_recorder_count += 1
+	if slot != nil {
+		parent               = slot.span_id
+		prev_status          = slot.status
+		prev_attr            = slot.attr_i64
+		prev_attr_overridden = slot.attr_overridden
+
+		if parent == 0 {
+			tls_active_recorder_count += 1
+		}
+		slot.span_id         = id
+		slot.status          = .Ok
+		slot.attr_i64        = attr_i64
+		slot.attr_overridden = false
+		tls_active_span_id   = id
 	}
-	slot.span_id         = id
-	slot.status          = .Ok
-	slot.attr_i64        = attr_i64
-	slot.attr_overridden = false
-	tls_active_span_id   = id
 
 	stored_scope := scope
 	stored_name  := name
 	cloned       := false
 	if r.cfg.string_fallback_copy {
-		stored_scope, stored_name = clone_string_pair(r, scope, name)
-		cloned = true
+		var_s, var_n, clone_ok := clone_string_pair(r, scope, name)
+		if !clone_ok {
+			if slot != nil {
+				if parent == 0 {
+					slot^ = {}
+					tls_active_recorder_count = max(tls_active_recorder_count - 1, 0)
+				} else {
+					slot.span_id         = parent
+					slot.status          = prev_status
+					slot.attr_i64        = prev_attr
+					slot.attr_overridden = prev_attr_overridden
+				}
+				if parent != 0 {
+					tls_active_span_id = parent
+				} else if tls_active_recorder_count == 0 {
+					tls_active_span_id = 0
+				} else {
+					active_id: u64 = 0
+					for i in 0 ..< MAX_TLS_RECORDERS {
+						if tls_recorder_spans[i].span_id != 0 {
+							active_id = tls_recorder_spans[i].span_id
+							break
+						}
+					}
+					tls_active_span_id = active_id
+				}
+			}
+			_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
+			return Span_Guard{}
+		}
+		stored_scope = var_s
+		stored_name  = var_n
+		cloned       = true
 	}
 
 	return Span_Guard{
 		recorder             = r,
+		recorder_id          = r._instance_id,
 		start_mono_ns        = monotonic_now_ns(),
 		span_id              = id,
 		prev_parent          = parent,
@@ -848,12 +919,20 @@ span_end :: #force_inline proc(g: Span_Guard) {
 	final_status := g.status
 	final_attr   := g.attr_i64
 
+	env      := current_actor_env()
 	slot_idx := int(g.tls_slot_idx)
 	slot: ^TLS_Recorder_Span
-	if slot_idx >= 0 && slot_idx < MAX_TLS_RECORDERS && tls_recorder_spans[slot_idx].recorder == g.recorder {
+	if slot_idx >= 0 && slot_idx < MAX_TLS_RECORDERS &&
+	   tls_recorder_spans[slot_idx].recorder == g.recorder &&
+	   tls_recorder_spans[slot_idx].recorder_id == g.recorder_id &&
+	   tls_recorder_spans[slot_idx].actor_env == env &&
+	   tls_recorder_spans[slot_idx].span_id == g.span_id {
 		slot = &tls_recorder_spans[slot_idx]
-	} else {
-		slot = tls_find_recorder_slot(g.recorder)
+	} else if g.recorder._instance_id == g.recorder_id {
+		found := tls_find_recorder_slot(g.recorder)
+		if found != nil && found.span_id == g.span_id {
+			slot = found
+		}
 	}
 	if slot != nil {
 		if final_status == .Ok {
@@ -871,20 +950,20 @@ span_end :: #force_inline proc(g: Span_Guard) {
 			slot.attr_i64        = g.prev_attr
 			slot.attr_overridden = g.prev_attr_overridden
 		}
-	}
-	if g.prev_parent != 0 {
-		tls_active_span_id = g.prev_parent
-	} else if tls_active_recorder_count == 0 {
-		tls_active_span_id = 0
-	} else {
-		active_id: u64 = 0
-		for i in 0 ..< MAX_TLS_RECORDERS {
-			if tls_recorder_spans[i].span_id != 0 {
-				active_id = tls_recorder_spans[i].span_id
-				break
+		if g.prev_parent != 0 {
+			tls_active_span_id = g.prev_parent
+		} else if tls_active_recorder_count == 0 {
+			tls_active_span_id = 0
+		} else {
+			active_id: u64 = 0
+			for i in 0 ..< MAX_TLS_RECORDERS {
+				if tls_recorder_spans[i].span_id != 0 {
+					active_id = tls_recorder_spans[i].span_id
+					break
+				}
 			}
+			tls_active_span_id = active_id
 		}
-		tls_active_span_id = active_id
 	}
 
 	record_raw(
@@ -964,18 +1043,45 @@ emit_point :: #force_inline proc(
 // -----------------------------------------------------------------------------
 
 @(private)
-clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s, n: string) {
+recorder_locked_allocator_proc :: proc(
+	allocator_data: rawptr,
+	mode:           mem.Allocator_Mode,
+	size:           int,
+	alignment:      int,
+	old_memory:     rawptr,
+	old_size:       int,
+	loc := #caller_location,
+) -> ([]byte, mem.Allocator_Error) {
+	r := (^Recorder)(allocator_data)
+	if r == nil || r.allocator.procedure == nil {
+		return nil, .Invalid_Pointer
+	}
+	sync.mutex_lock(&r._alloc_mu)
+	defer sync.mutex_unlock(&r._alloc_mu)
+	return r.allocator.procedure(r.allocator.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+@(private)
+recorder_locked_allocator :: #force_inline proc(r: ^Recorder) -> mem.Allocator {
+	return mem.Allocator{
+		procedure = recorder_locked_allocator_proc,
+		data      = r,
+	}
+}
+
+@(private)
+clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s, n: string, ok: bool) {
 	s_len := len(scope)
 	n_len := len(name)
 	total := s_len + n_len
 	if total <= 0 {
-		return "", ""
+		return "", "", true
 	}
 	sync.mutex_lock(&r._alloc_mu)
 	buf, err := mem.alloc_bytes_non_zeroed(total, 1, r.allocator)
 	sync.mutex_unlock(&r._alloc_mu)
 	if err != nil || buf == nil {
-		return "", ""
+		return "", "", false
 	}
 	ptr := raw_data(buf)
 	if s_len > 0 {
@@ -986,7 +1092,7 @@ clone_string_pair :: #force_inline proc(r: ^Recorder, scope, name: string) -> (s
 		mem.copy_non_overlapping(rawptr(uintptr(ptr) + uintptr(s_len)), raw_data(name), n_len)
 		n = string(buf[s_len:total])
 	}
-	return
+	return s, n, true
 }
 
 @(private)
@@ -1058,7 +1164,13 @@ record_raw :: #force_inline proc(
 	}
 
 	if r.cfg.string_fallback_copy && !already_cloned {
-		stored_scope, stored_name = clone_string_pair(r, scope, name)
+		var_s, var_n, clone_ok := clone_string_pair(r, scope, name)
+		if !clone_ok {
+			_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
+			return
+		}
+		stored_scope = var_s
+		stored_name  = var_n
 		owns_strings = true
 	}
 
@@ -1135,7 +1247,7 @@ free_page_strings :: proc(r: ^Recorder, page: ^Staging_Page) {
 }
 
 @(private)
-rotate_active_page_locked :: proc(r: ^Recorder) {
+rotate_active_page_locked :: proc(r: ^Recorder, notify_worker: bool = true) {
 	was_empty := r._ready_count == 0
 	ready_ring_push_locked(r, r._active_page_idx)
 	if r._free_top > 0 {
@@ -1144,6 +1256,9 @@ rotate_active_page_locked :: proc(r: ^Recorder) {
 		r._active_page_idx = next_idx
 	} else {
 		r._active_page_idx = -1
+	}
+	if !notify_worker {
+		return
 	}
 	if r.cfg.backend == .Sleipnir_Actor {
 		if was_empty && !r._worker_paused && r._flusher_actor != nil {
@@ -1204,7 +1319,8 @@ acquire_free_page_locked :: proc(r: ^Recorder) -> bool {
 flusher_engine_init :: proc(eng: ^Flusher_Engine, r: ^Recorder) -> bool {
 	eng.r        = r
 	eng.file_seq = 0
-	oa.buffer_pool_init(&eng.pool, r._page_alloc)
+	locked_alloc := recorder_locked_allocator(r)
+	oa.buffer_pool_init(&eng.pool, locked_alloc)
 
 	prev_alloc := context.allocator
 	context.allocator = oa.buffer_pool_allocator(&eng.pool)
@@ -1217,7 +1333,7 @@ flusher_engine_init :: proc(eng: ^Flusher_Engine, r: ^Recorder) -> bool {
 	}
 	eng.schema = schema
 
-	batches, b_err := make([dynamic]oa.Record_Batch, 0, r.cfg.batches_per_file, r._page_alloc)
+	batches, b_err := make([dynamic]oa.Record_Batch, 0, r.cfg.batches_per_file, locked_alloc)
 	if b_err != nil {
 		oa.schema_free(&eng.schema)
 		oa.buffer_pool_destroy(&eng.pool)
@@ -1230,6 +1346,8 @@ flusher_engine_init :: proc(eng: ^Flusher_Engine, r: ^Recorder) -> bool {
 
 @(private)
 flusher_engine_destroy :: proc(eng: ^Flusher_Engine) {
+	sync.mutex_lock(&eng.mu)
+	defer sync.mutex_unlock(&eng.mu)
 	if !eng.initialized {
 		return
 	}
@@ -1267,11 +1385,15 @@ flusher_engine_flush_segment :: proc(eng: ^Flusher_Engine) {
 	if written {
 		eng.file_seq += 1
 		_ = intrinsics.atomic_add(&r._flushed_segments, 1)
+	} else {
+		_ = intrinsics.atomic_add_explicit(&r._failed_segments, 1, .Relaxed)
 	}
 }
 
 @(private)
 flusher_engine_drain_ready_pages :: proc(eng: ^Flusher_Engine, force_flush: bool) {
+	sync.mutex_lock(&eng.mu)
+	defer sync.mutex_unlock(&eng.mu)
 	if !eng.initialized {
 		return
 	}
@@ -1316,7 +1438,10 @@ flusher_engine_drain_ready_pages :: proc(eng: ^Flusher_Engine, force_flush: bool
 		if batch, ok := build_arrow_batch(&eng.schema, page); ok {
 			if _, append_err := append(&eng.segment_batches, batch); append_err != nil {
 				oa.record_batch_free(&batch)
+				_ = intrinsics.atomic_add_explicit(&r._dropped_records, u64(expected), .Relaxed)
 			}
+		} else {
+			_ = intrinsics.atomic_add_explicit(&r._dropped_records, u64(expected), .Relaxed)
 		}
 		if r.cfg.string_fallback_copy {
 			free_page_strings(r, page)
@@ -1495,14 +1620,37 @@ build_string_column_from_soa :: #force_inline proc(
 }
 
 @(private)
+validate_record_batch_column :: #force_inline proc(
+	col:        ^oa.Array,
+	batch_len:  int,
+	min_bufs:   int,
+	elem_bytes: int,
+) -> bool {
+	if col == nil || batch_len < 0 || len(col.buffers) < min_bufs || col.offset < 0 || batch_len > col.length {
+		return false
+	}
+	req_elems := col.offset + batch_len
+	if min_bufs >= 3 {
+		req_elems += 1
+	}
+	if req_elems > 0 && (col.buffers[1].data == nil || col.buffers[1].size < req_elems * elem_bytes) {
+		return false
+	}
+	if min_bufs >= 3 && col.buffers[2].size > 0 && col.buffers[2].data == nil {
+		return false
+	}
+	return true
+}
+
 decode_string_from_buffers :: #force_inline proc(
-	offsets: [^]i32,
-	bytes:   [^]u8,
-	row_idx: int,
+	offsets:    [^]i32,
+	bytes:      [^]u8,
+	bytes_size: int,
+	row_idx:    int,
 ) -> string {
 	start := int(offsets[row_idx])
 	end   := int(offsets[row_idx + 1])
-	if end <= start || bytes == nil {
+	if start < 0 || end <= start || end > bytes_size || bytes == nil {
 		return ""
 	}
 	return string(bytes[start:end])

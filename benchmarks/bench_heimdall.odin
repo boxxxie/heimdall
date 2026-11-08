@@ -14,7 +14,7 @@
 //
 // Run via:
 //   odin run benchmarks -o:speed -no-bounds-check
-//   odin check benchmarks -vet -strict-style -vet-tabs -vet-packages:heimdall_benchmarks,heimdall
+//   odin check benchmarks -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
 // =============================================================================
 
 package heimdall_benchmarks
@@ -179,11 +179,11 @@ run_ingestion_bench :: proc(
 	producer_elapsed := time.tick_since(t0)
 
 	heimdall.recorder_flush(&rec)
+	total_elapsed    := time.tick_since(t0)
 	producer_allocs  := track.total_allocation_count
 	producer_alloc_b := track.total_memory_allocated
 	context.allocator = prev_alloc
 	heimdall.recorder_destroy(&rec)
-	total_elapsed := time.tick_since(t0)
 
 	elapsed := total_elapsed if measure_flush else producer_elapsed
 	flushed, dropped := heimdall.recorder_diagnostics(&rec)

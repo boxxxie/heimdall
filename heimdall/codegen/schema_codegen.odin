@@ -262,6 +262,7 @@ emit_telemetry_schema_code :: proc(
 		if f.is_string {
 			fmt.sbprintf(&sb, "\t%s_offsets: [^]i32,\n", f.name)
 			fmt.sbprintf(&sb, "\t%s_bytes: [^]u8,\n", f.name)
+			fmt.sbprintf(&sb, "\t%s_bytes_size: int,\n", f.name)
 		} else {
 			fmt.sbprintf(&sb, "\t%s_data: [^]%s,\n", f.name, f.odin_type)
 		}
@@ -282,18 +283,23 @@ emit_telemetry_schema_code :: proc(
 		if idx > 0 {
 			fmt.sbprint(&sb, " &&\n\t     ")
 		}
-		fmt.sbprintf(&sb, "reader.%s_col != nil", f.name)
+		if f.is_string {
+			fmt.sbprintf(&sb, "validate_record_batch_column(reader.%s_col, b.length, 3, size_of(i32))", f.name)
+		} else {
+			fmt.sbprintf(&sb, "validate_record_batch_column(reader.%s_col, b.length, 2, size_of(%s))", f.name, f.odin_type)
+		}
 	}
 	fmt.sbprintln(&sb)
 	fmt.sbprintln(&sb, "\tif !ok {")
-	fmt.sbprintln(&sb, "\t\treturn")
+	fmt.sbprintln(&sb, "\t\treturn {}, false")
 	fmt.sbprintln(&sb, "\t}")
 	for f in spec.fields {
 		if f.is_string {
-			fmt.sbprintf(&sb, "\treader.%s_offsets = (cast([^]i32)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n", f.name, f.name, f.name)
+			fmt.sbprintf(&sb, "\tif reader.%s_col.buffers[1].data != nil {{\n\t\treader.%s_offsets = (cast([^]i32)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n\t}}\n", f.name, f.name, f.name, f.name)
 			fmt.sbprintf(&sb, "\treader.%s_bytes = reader.%s_col.buffers[2].data\n", f.name, f.name)
+			fmt.sbprintf(&sb, "\treader.%s_bytes_size = reader.%s_col.buffers[2].size\n", f.name, f.name)
 		} else {
-			fmt.sbprintf(&sb, "\treader.%s_data = (cast([^]%s)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n", f.name, f.odin_type, f.name, f.name)
+			fmt.sbprintf(&sb, "\tif reader.%s_col.buffers[1].data != nil {{\n\t\treader.%s_data = (cast([^]%s)reader.%s_col.buffers[1].data)[reader.%s_col.offset:]\n\t}}\n", f.name, f.name, f.odin_type, f.name, f.name)
 		}
 	}
 	fmt.sbprintln(&sb, "\treturn")
@@ -303,7 +309,7 @@ emit_telemetry_schema_code :: proc(
 	fmt.sbprintf(&sb, "\treturn %s{{\n", rec_name)
 	for f in spec.fields {
 		if f.is_string {
-			fmt.sbprintf(&sb, "\t\t%s = decode_string_from_buffers(reader.%s_offsets, reader.%s_bytes, row_idx),\n", f.name, f.name, f.name)
+			fmt.sbprintf(&sb, "\t\t%s = decode_string_from_buffers(reader.%s_offsets, reader.%s_bytes, reader.%s_bytes_size, row_idx),\n", f.name, f.name, f.name, f.name)
 		} else {
 			fmt.sbprintf(&sb, "\t\t%s = reader.%s_data[row_idx],\n", f.name, f.name)
 		}
@@ -428,7 +434,7 @@ is_heimdall_telemetry_call :: proc(expr: ^ast.Expr) -> (proc_name: string, is_sc
 }
 
 @(private)
-extract_static_string_arg :: proc(arg: ^ast.Expr) -> (lit_val: string, is_static: bool) {
+extract_static_string_arg :: proc(arg: ^ast.Expr, const_strings: map[string]string = nil) -> (lit_val: string, is_static: bool) {
 	if arg == nil {
 		return "", false
 	}
@@ -436,10 +442,43 @@ extract_static_string_arg :: proc(arg: ^ast.Expr) -> (lit_val: string, is_static
 	if fv, is_fv := expr.derived.(^ast.Field_Value); is_fv {
 		expr = fv.value
 	}
+	for _ in 0 ..< 8 {
+		if p, is_p := expr.derived.(^ast.Paren_Expr); is_p {
+			expr = p.expr
+		} else {
+			break
+		}
+	}
 	if lit, is_lit := expr.derived.(^ast.Basic_Lit); is_lit && lit.tok.kind == .String {
 		return unquote_ast_string(lit.tok.text), true
 	}
+	if ident, is_ident := expr.derived.(^ast.Ident); is_ident && const_strings != nil {
+		if val, found := const_strings[ident.name]; found {
+			return val, true
+		}
+	}
 	return "", false
+}
+
+@(private)
+collect_const_strings_visit :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
+	if node == nil {
+		return nil
+	}
+	const_map := (^map[string]string)(visitor.data)
+	if vd, is_vd := node.derived.(^ast.Value_Decl); is_vd && !vd.is_mutable {
+		for name_expr, idx in vd.names {
+			if idx >= len(vd.values) {
+				break
+			}
+			if ident, is_ident := name_expr.derived.(^ast.Ident); is_ident {
+				if lit_val, is_static := extract_static_string_arg(vd.values[idx], const_map^); is_static {
+					const_map^[ident.name] = lit_val
+				}
+			}
+		}
+	}
+	return visitor
 }
 
 @(private)
@@ -488,26 +527,28 @@ expr_has_call_visit :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visi
 }
 
 @(private)
-stmt_is_trivial_return :: proc(stmt: ^ast.Stmt) -> bool {
+stmt_is_immediate_exit :: proc(stmt: ^ast.Stmt) -> bool {
 	if stmt == nil {
 		return false
 	}
-	ret, is_ret := stmt.derived.(^ast.Return_Stmt)
-	if !is_ret {
-		return false
-	}
-	has_call := false
-	v := ast.Visitor{
-		visit = expr_has_call_visit,
-		data  = &has_call,
-	}
-	for res in ret.results {
-		ast.walk(&v, res)
-		if has_call {
-			return false
+	#partial switch s in stmt.derived {
+	case ^ast.Branch_Stmt:
+		return true
+	case ^ast.Return_Stmt:
+		has_call := false
+		v := ast.Visitor{
+			visit = expr_has_call_visit,
+			data  = &has_call,
 		}
+		for res in s.results {
+			ast.walk(&v, res)
+			if has_call {
+				return false
+			}
+		}
+		return true
 	}
-	return true
+	return false
 }
 
 @(private)
@@ -516,7 +557,7 @@ count_misplaced_scoped_spans_in_stmt_list :: proc(stmts: []^ast.Stmt) -> int {
 	if len(stmts) > 0 && stmt_is_scoped_span_call(stmts[len(stmts) - 1]) {
 		count += 1
 	}
-	if len(stmts) >= 2 && stmt_is_scoped_span_call(stmts[len(stmts) - 2]) && stmt_is_trivial_return(stmts[len(stmts) - 1]) {
+	if len(stmts) >= 2 && stmt_is_scoped_span_call(stmts[len(stmts) - 2]) && stmt_is_immediate_exit(stmts[len(stmts) - 1]) {
 		count += 1
 	}
 	return count
@@ -528,6 +569,7 @@ Call_Site_Walk_Ctx :: struct {
 	scope_set:        ^map[string]bool,
 	name_set:         ^map[string]bool,
 	string_set:       ^map[string]bool,
+	const_strings:    ^map[string]string,
 	in_actor_handler: bool,
 }
 
@@ -572,7 +614,11 @@ record_unique_string :: proc(set: ^map[string]bool, val: string) {
 
 @(private)
 record_telemetry_string_arg :: proc(ctx: ^Call_Site_Walk_Ctx, expr: ^ast.Expr, is_scope: bool) {
-	if lit_val, is_static := extract_static_string_arg(expr); is_static {
+	const_map: map[string]string = nil
+	if ctx.const_strings != nil {
+		const_map = ctx.const_strings^
+	}
+	if lit_val, is_static := extract_static_string_arg(expr, const_map); is_static {
 		ctx.report.static_string_literals += 1
 		record_unique_string(ctx.string_set, lit_val)
 		if is_scope {
@@ -602,10 +648,15 @@ call_site_visit_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Vis
 			ctx.in_actor_handler = prev_actor
 			return nil
 		}
+	case ^ast.Defer_Stmt:
+		// `defer heimdall.scoped_span(...)` delays `span_begin` until scope exit and measures zero duration!
+		if stmt_is_scoped_span_call(n.stmt) {
+			ctx.report.misplaced_scoped_spans += 1
+		}
 	case ^ast.Block_Stmt:
 		// If `scoped_span(...)` is the LAST statement of a block (or immediately precedes
-		// a trivial `return`), `@(deferred_out = span_end)` exits immediately without
-		// wrapping any work!
+		// a trivial `return`, `break`, or `continue`), `@(deferred_out = span_end)` exits
+		// immediately without wrapping any work!
 		ctx.report.misplaced_scoped_spans += count_misplaced_scoped_spans_in_stmt_list(n.stmts)
 	case ^ast.Case_Clause:
 		ctx.report.misplaced_scoped_spans += count_misplaced_scoped_spans_in_stmt_list(n.body)
@@ -661,22 +712,37 @@ analyze_telemetry_call_sites :: proc(
 		delete(string_set)
 	}
 
+	const_strings := make(map[string]string, 32, ast_alloc)
 	walk_ctx := Call_Site_Walk_Ctx{
-		report     = &report,
-		scope_set  = &scope_set,
-		name_set   = &name_set,
-		string_set = &string_set,
+		report        = &report,
+		scope_set     = &scope_set,
+		name_set      = &name_set,
+		string_set    = &string_set,
+		const_strings = &const_strings,
+	}
+	const_v := ast.Visitor{
+		visit = collect_const_strings_visit,
+		data  = &const_strings,
 	}
 	v := ast.Visitor{
 		visit = call_site_visit_node,
 		data  = &walk_ctx,
 	}
 
+	parsed_files := make([dynamic]^ast.File, 0, len(sources), ast_alloc)
 	for src in sources {
 		file, p_ok := parse_odin_source_into_ast(src, "telemetry_call_sites.odin", ast_alloc)
 		if !p_ok {
 			return {}, false
 		}
+		append(&parsed_files, file)
+		ast.walk(&const_v, file)
+	}
+	// Second pass allows out-of-order constant references across declarations/files (`B :: A; A :: "lit"`).
+	for file in parsed_files {
+		ast.walk(&const_v, file)
+	}
+	for file in parsed_files {
 		ast.walk(&v, file)
 	}
 

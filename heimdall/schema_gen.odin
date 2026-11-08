@@ -99,8 +99,10 @@ Record_Batch_Reader :: struct {
 	status_data: [^]Status,
 	scope_offsets: [^]i32,
 	scope_bytes: [^]u8,
+	scope_bytes_size: int,
 	name_offsets: [^]i32,
 	name_bytes: [^]u8,
+	name_bytes_size: int,
 	value_f64_data: [^]f64,
 	attr_i64_data: [^]i64,
 }
@@ -122,33 +124,57 @@ record_batch_reader_resolve :: proc(b: ^oa.Record_Batch) -> (reader: Record_Batc
 		value_f64_col = oa.record_batch_column(b, "value_f64"),
 		attr_i64_col = oa.record_batch_column(b, "attr_i64"),
 	}
-	ok = reader.timestamp_ns_col != nil &&
-	     reader.duration_ns_col != nil &&
-	     reader.span_id_col != nil &&
-	     reader.parent_id_col != nil &&
-	     reader.thread_id_col != nil &&
-	     reader.kind_col != nil &&
-	     reader.status_col != nil &&
-	     reader.scope_col != nil &&
-	     reader.name_col != nil &&
-	     reader.value_f64_col != nil &&
-	     reader.attr_i64_col != nil
+	ok = validate_record_batch_column(reader.timestamp_ns_col, b.length, 2, size_of(i64)) &&
+	     validate_record_batch_column(reader.duration_ns_col, b.length, 2, size_of(i64)) &&
+	     validate_record_batch_column(reader.span_id_col, b.length, 2, size_of(u64)) &&
+	     validate_record_batch_column(reader.parent_id_col, b.length, 2, size_of(u64)) &&
+	     validate_record_batch_column(reader.thread_id_col, b.length, 2, size_of(u32)) &&
+	     validate_record_batch_column(reader.kind_col, b.length, 2, size_of(Kind)) &&
+	     validate_record_batch_column(reader.status_col, b.length, 2, size_of(Status)) &&
+	     validate_record_batch_column(reader.scope_col, b.length, 3, size_of(i32)) &&
+	     validate_record_batch_column(reader.name_col, b.length, 3, size_of(i32)) &&
+	     validate_record_batch_column(reader.value_f64_col, b.length, 2, size_of(f64)) &&
+	     validate_record_batch_column(reader.attr_i64_col, b.length, 2, size_of(i64))
 	if !ok {
-		return
+		return {}, false
 	}
-	reader.timestamp_ns_data = (cast([^]i64)reader.timestamp_ns_col.buffers[1].data)[reader.timestamp_ns_col.offset:]
-	reader.duration_ns_data = (cast([^]i64)reader.duration_ns_col.buffers[1].data)[reader.duration_ns_col.offset:]
-	reader.span_id_data = (cast([^]u64)reader.span_id_col.buffers[1].data)[reader.span_id_col.offset:]
-	reader.parent_id_data = (cast([^]u64)reader.parent_id_col.buffers[1].data)[reader.parent_id_col.offset:]
-	reader.thread_id_data = (cast([^]u32)reader.thread_id_col.buffers[1].data)[reader.thread_id_col.offset:]
-	reader.kind_data = (cast([^]Kind)reader.kind_col.buffers[1].data)[reader.kind_col.offset:]
-	reader.status_data = (cast([^]Status)reader.status_col.buffers[1].data)[reader.status_col.offset:]
-	reader.scope_offsets = (cast([^]i32)reader.scope_col.buffers[1].data)[reader.scope_col.offset:]
+	if reader.timestamp_ns_col.buffers[1].data != nil {
+		reader.timestamp_ns_data = (cast([^]i64)reader.timestamp_ns_col.buffers[1].data)[reader.timestamp_ns_col.offset:]
+	}
+	if reader.duration_ns_col.buffers[1].data != nil {
+		reader.duration_ns_data = (cast([^]i64)reader.duration_ns_col.buffers[1].data)[reader.duration_ns_col.offset:]
+	}
+	if reader.span_id_col.buffers[1].data != nil {
+		reader.span_id_data = (cast([^]u64)reader.span_id_col.buffers[1].data)[reader.span_id_col.offset:]
+	}
+	if reader.parent_id_col.buffers[1].data != nil {
+		reader.parent_id_data = (cast([^]u64)reader.parent_id_col.buffers[1].data)[reader.parent_id_col.offset:]
+	}
+	if reader.thread_id_col.buffers[1].data != nil {
+		reader.thread_id_data = (cast([^]u32)reader.thread_id_col.buffers[1].data)[reader.thread_id_col.offset:]
+	}
+	if reader.kind_col.buffers[1].data != nil {
+		reader.kind_data = (cast([^]Kind)reader.kind_col.buffers[1].data)[reader.kind_col.offset:]
+	}
+	if reader.status_col.buffers[1].data != nil {
+		reader.status_data = (cast([^]Status)reader.status_col.buffers[1].data)[reader.status_col.offset:]
+	}
+	if reader.scope_col.buffers[1].data != nil {
+		reader.scope_offsets = (cast([^]i32)reader.scope_col.buffers[1].data)[reader.scope_col.offset:]
+	}
 	reader.scope_bytes = reader.scope_col.buffers[2].data
-	reader.name_offsets = (cast([^]i32)reader.name_col.buffers[1].data)[reader.name_col.offset:]
+	reader.scope_bytes_size = reader.scope_col.buffers[2].size
+	if reader.name_col.buffers[1].data != nil {
+		reader.name_offsets = (cast([^]i32)reader.name_col.buffers[1].data)[reader.name_col.offset:]
+	}
 	reader.name_bytes = reader.name_col.buffers[2].data
-	reader.value_f64_data = (cast([^]f64)reader.value_f64_col.buffers[1].data)[reader.value_f64_col.offset:]
-	reader.attr_i64_data = (cast([^]i64)reader.attr_i64_col.buffers[1].data)[reader.attr_i64_col.offset:]
+	reader.name_bytes_size = reader.name_col.buffers[2].size
+	if reader.value_f64_col.buffers[1].data != nil {
+		reader.value_f64_data = (cast([^]f64)reader.value_f64_col.buffers[1].data)[reader.value_f64_col.offset:]
+	}
+	if reader.attr_i64_col.buffers[1].data != nil {
+		reader.attr_i64_data = (cast([^]i64)reader.attr_i64_col.buffers[1].data)[reader.attr_i64_col.offset:]
+	}
 	return
 }
 
@@ -161,8 +187,8 @@ record_batch_reader_decode_row :: #force_inline proc(reader: ^Record_Batch_Reade
 		thread_id = reader.thread_id_data[row_idx],
 		kind = reader.kind_data[row_idx],
 		status = reader.status_data[row_idx],
-		scope = decode_string_from_buffers(reader.scope_offsets, reader.scope_bytes, row_idx),
-		name = decode_string_from_buffers(reader.name_offsets, reader.name_bytes, row_idx),
+		scope = decode_string_from_buffers(reader.scope_offsets, reader.scope_bytes, reader.scope_bytes_size, row_idx),
+		name = decode_string_from_buffers(reader.name_offsets, reader.name_bytes, reader.name_bytes_size, row_idx),
 		value_f64 = reader.value_f64_data[row_idx],
 		attr_i64 = reader.attr_i64_data[row_idx],
 	}
