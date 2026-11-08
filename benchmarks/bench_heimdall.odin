@@ -20,6 +20,7 @@
 package heimdall_benchmarks
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -58,9 +59,9 @@ next_bench_prefix :: proc() -> string {
 
 @(private)
 cleanup_arrow_segments :: proc(prefix: string, max_segments := 512) -> (files_removed: int, total_bytes: i64) {
-	buf: [512]byte
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	for i in 0 ..< max_segments {
-		filename := fmt.bprintf(buf[:], "%s_%06d.arrow", prefix, i)
+		filename := fmt.tprintf("%s_%06d.arrow", prefix, i)
 		if !os.exists(filename) {
 			if i > 0 {
 				break
@@ -172,7 +173,9 @@ run_ingestion_bench :: proc(
 	prev_alloc := context.allocator
 	tracked_alloc := mem.tracking_allocator(&track)
 	context.allocator = tracked_alloc
+	sync.mutex_lock(&rec._alloc_mu)
 	rec.allocator = tracked_alloc
+	sync.mutex_unlock(&rec._alloc_mu)
 
 	t0 := time.tick_now()
 	body(&rec)
@@ -183,7 +186,9 @@ run_ingestion_bench :: proc(
 	producer_allocs  := track.total_allocation_count
 	producer_alloc_b := track.total_memory_allocated
 	context.allocator = prev_alloc
+	sync.mutex_lock(&rec._alloc_mu)
 	rec.allocator     = prev_alloc
+	sync.mutex_unlock(&rec._alloc_mu)
 	heimdall.recorder_destroy(&rec)
 
 	elapsed := total_elapsed if measure_flush else producer_elapsed
@@ -1096,9 +1101,8 @@ run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
 	t_read0   := time.tick_now()
 	rows_read := 0
 	checksum: i64 = 0
-	buf: [512]byte
 	for seg_idx in 0 ..< SEGMENTS {
-		filename := fmt.bprintf(buf[:], "%s_%06d.arrow", prefix, seg_idx)
+		filename := fmt.tprintf("%s_%06d.arrow", prefix, seg_idx)
 		sc, batches, ok := oa.ipc_read_file(filename)
 		if !ok {
 			continue

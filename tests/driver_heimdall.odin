@@ -92,10 +92,9 @@ driver_destroy :: proc(s: ^Suite_Ctx) {
 	if heimdall.default_recorder() == &s.rec {
 		heimdall.set_default_recorder(nil)
 	}
-	cfg_buf: [512]byte
 	cfg_prefix := ""
 	if len(s.rec.cfg.file_prefix) > 0 && s.rec.cfg.file_prefix != s.file_prefix {
-		cfg_prefix = fmt.bprintf(cfg_buf[:], "%s", s.rec.cfg.file_prefix)
+		cfg_prefix = strings.clone(s.rec.cfg.file_prefix, context.temp_allocator)
 	}
 	if s.rec_active {
 		driver_shutdown_recorder(s)
@@ -124,10 +123,9 @@ driver_shutdown_and_cleanup_prior_recorder :: proc(s: ^Suite_Ctx) {
 	if !s.rec_active {
 		return
 	}
-	old_prefix_buf: [512]byte
 	old_prefix := ""
 	if len(s.rec.cfg.file_prefix) > 0 && s.rec.cfg.file_prefix != s.file_prefix {
-		old_prefix = fmt.bprintf(old_prefix_buf[:], "%s", s.rec.cfg.file_prefix)
+		old_prefix = strings.clone(s.rec.cfg.file_prefix, context.temp_allocator)
 	}
 	driver_shutdown_recorder(s)
 	if len(old_prefix) > 0 {
@@ -455,8 +453,7 @@ driver_verify_auto_backend_selection_and_overrides :: proc(
 	actor_override_mode:      heimdall.Backend_Mode,
 	persisted_segments:       int,
 ) {
-	buf: [512]byte
-	auto_prefix := fmt.bprintf(buf[:], "%s_auto_matrix", s.file_prefix)
+	auto_prefix := fmt.tprintf("%s_auto_matrix", s.file_prefix)
 	defer driver_cleanup_segment_files(auto_prefix)
 
 	// 1. Plain OS thread + `.Auto` -> `.Dedicated_Thread`
@@ -676,8 +673,7 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 	actor.use_scheduler(&s.shared_sched)
 	defer actor.use_scheduler(prev_amb_cycle)
 	{
-		iso_buf: [512]byte
-		iso_prefix := fmt.bprintf(iso_buf[:], "%s_ambient_iso", s.file_prefix)
+		iso_prefix := fmt.tprintf("%s_ambient_iso", s.file_prefix)
 		defer driver_cleanup_segment_files(iso_prefix)
 
 		iso_rec: heimdall.Recorder
@@ -700,9 +696,8 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 		}
 	}
 
-	buf: [512]byte
 	for c in 0 ..< cycles {
-		cycle_prefix := fmt.bprintf(buf[:], "%s_cycle_%d", s.file_prefix, c)
+		cycle_prefix := fmt.tprintf("%s_cycle_%d", s.file_prefix, c)
 		rec: heimdall.Recorder
 		if heimdall.recorder_init(&rec, heimdall.Config{
 			file_prefix      = cycle_prefix,
@@ -936,8 +931,7 @@ driver_shutdown_recorder :: proc(s: ^Suite_Ctx) {
 }
 
 driver_segment_file_exists :: proc(s: ^Suite_Ctx, segment_idx: int) -> bool {
-	buf: [512]byte
-	filename := fmt.bprintf(buf[:], "%s_%06d.arrow", s.file_prefix, segment_idx)
+	filename := fmt.tprintf("%s_%06d.arrow", s.file_prefix, segment_idx)
 	return os.exists(filename)
 }
 
@@ -948,8 +942,7 @@ driver_load_segment :: proc(s: ^Suite_Ctx, segment_idx: int) -> (seg: ^Loaded_Ar
 	if s.segments[segment_idx].loaded {
 		return &s.segments[segment_idx], true
 	}
-	buf: [512]byte
-	filename := fmt.bprintf(buf[:], "%s_%06d.arrow", s.file_prefix, segment_idx)
+	filename := fmt.tprintf("%s_%06d.arrow", s.file_prefix, segment_idx)
 	sc, batches, read_ok := oa.ipc_read_file(filename)
 	if !read_ok {
 		return nil, false
@@ -1138,10 +1131,8 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 	rec_b_rows:           int,
 	cross_recorder_leaks: int,
 ) {
-	buf_a: [512]byte
-	buf_b: [512]byte
-	prefix_a := fmt.bprintf(buf_a[:], "%s_iso_a", s.file_prefix)
-	prefix_b := fmt.bprintf(buf_b[:], "%s_iso_b", s.file_prefix)
+	prefix_a := fmt.tprintf("%s_iso_a", s.file_prefix)
+	prefix_b := fmt.tprintf("%s_iso_b", s.file_prefix)
 	defer {
 		driver_cleanup_segment_files(prefix_a)
 		driver_cleanup_segment_files(prefix_b)
@@ -1187,10 +1178,8 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 	heimdall.recorder_destroy(&rec_a)
 	heimdall.recorder_destroy(&rec_b)
 
-	file_a_buf: [512]byte
-	file_b_buf: [512]byte
-	file_a := fmt.bprintf(file_a_buf[:], "%s_000000.arrow", prefix_a)
-	file_b := fmt.bprintf(file_b_buf[:], "%s_000000.arrow", prefix_b)
+	file_a := fmt.tprintf("%s_000000.arrow", prefix_a)
+	file_b := fmt.tprintf("%s_000000.arrow", prefix_b)
 
 	sc_a, batches_a, ok_a := oa.ipc_read_file(file_a)
 	if !ok_a {
@@ -1264,8 +1253,7 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 
 	// Also verify that two Sleipnir actors stepped cooperatively via `actor.call`
 	// on the SAME 1-worker OS thread do not leak `parent_id` across actor turns.
-	buf_coop: [512]byte
-	prefix_coop := fmt.bprintf(buf_coop[:], "%s_coop_actor", s.file_prefix)
+	prefix_coop := fmt.tprintf("%s_coop_actor", s.file_prefix)
 	defer driver_cleanup_segment_files(prefix_coop)
 
 	coop_sched: actor.Scheduler
@@ -1305,8 +1293,7 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 	actor.destroy(callee)
 	heimdall.recorder_destroy(&rec_coop)
 
-	file_coop_buf: [512]byte
-	file_coop := fmt.bprintf(file_coop_buf[:], "%s_000000.arrow", prefix_coop)
+	file_coop := fmt.tprintf("%s_000000.arrow", prefix_coop)
 	sc_c, batches_c, ok_c := oa.ipc_read_file(file_coop)
 	if !ok_c || len(batches_c) != 1 {
 		cross_recorder_leaks += 1
@@ -1409,8 +1396,7 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 	// for another recorder (`rec_b`) on the same thread, and verify that > `MAX_TLS_RECORDERS` (16)
 	// concurrent active recorders on one thread degrade gracefully without clobbering slot 0.
 	{
-		buf_reinit: [512]byte
-		prefix_reinit := fmt.bprintf(buf_reinit[:], "%s_reinit_span", s.file_prefix)
+		prefix_reinit := fmt.tprintf("%s_reinit_span", s.file_prefix)
 		defer driver_cleanup_segment_files(prefix_reinit)
 
 		if heimdall.recorder_init(&rec_coop, heimdall.Config{
@@ -1520,8 +1506,7 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 		fake_ctxs:   [heimdall.MAX_TLS_RECORDERS + 1]actor.Context
 		fake_envs:   [heimdall.MAX_TLS_RECORDERS + 1]u64
 		many_guards: [heimdall.MAX_TLS_RECORDERS + 1]heimdall.Span_Guard
-		m_buf: [512]byte
-		m_pfx := fmt.bprintf(m_buf[:], "%s_many_slots", s.file_prefix)
+		m_pfx := fmt.tprintf("%s_many_slots", s.file_prefix)
 		if heimdall.recorder_init(&rec_coop, heimdall.Config{
 			file_prefix      = m_pfx,
 			batches_per_file = 1,
@@ -1654,8 +1639,7 @@ driver_run_concurrent_dynamic_string_producers :: proc(
 	mem.arena_init(&arena, backing)
 	arena_alloc := mem.arena_allocator(&arena)
 
-	prefix_buf: [512]byte
-	custom_prefix := fmt.bprintf(prefix_buf[:], "%s_mt_dyn", s.file_prefix)
+	custom_prefix := fmt.tprintf("%s_mt_dyn", s.file_prefix)
 	defer driver_cleanup_segment_files(custom_prefix)
 
 	rec: heimdall.Recorder
@@ -1694,9 +1678,8 @@ driver_run_concurrent_dynamic_string_producers :: proc(
 	heimdall.recorder_flush(&rec)
 	heimdall.recorder_destroy(&rec)
 
-	seg_buf: [512]byte
 	for seg_idx in 0 ..< MAX_LOADED_SEGMENTS {
-		fname := fmt.bprintf(seg_buf[:], "%s_%06d.arrow", custom_prefix, seg_idx)
+		fname := fmt.tprintf("%s_%06d.arrow", custom_prefix, seg_idx)
 		if !os.exists(fname) {
 			break
 		}
@@ -1829,8 +1812,7 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 			data      = &fail_state,
 		}
 
-		oom_prefix_buf: [512]byte
-		oom_prefix := fmt.bprintf(oom_prefix_buf[:], "%s_mid_batch_oom", s.file_prefix)
+		oom_prefix := fmt.tprintf("%s_mid_batch_oom", s.file_prefix)
 		defer driver_cleanup_segment_files(oom_prefix)
 
 		rec: heimdall.Recorder
@@ -1862,8 +1844,7 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 	// Pass 1 checks `if s_len < 0 || total_bytes > int(max(i32)) - s_len` before touching `raw_data(s)`
 	// and frees `off_buf` + `cols[0..7]` via `build_arrow_batch`'s `defer if !ok`.
 	{
-		ovf_prefix_buf: [512]byte
-		ovf_prefix := fmt.bprintf(ovf_prefix_buf[:], "%s_str_ovf", s.file_prefix)
+		ovf_prefix := fmt.tprintf("%s_str_ovf", s.file_prefix)
 		defer driver_cleanup_segment_files(ovf_prefix)
 
 		rec: heimdall.Recorder
@@ -1895,8 +1876,7 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 	// Part 3: Deferred `scoped_span` with `string_fallback_copy = true` exiting AFTER `recorder_destroy(&rec)`
 	// in the same block must free its cloned strings cleanly using `rec.allocator` without crashing.
 	{
-		def_prefix_buf: [512]byte
-		def_prefix := fmt.bprintf(def_prefix_buf[:], "%s_def_span", s.file_prefix)
+		def_prefix := fmt.tprintf("%s_def_span", s.file_prefix)
 		defer driver_cleanup_segment_files(def_prefix)
 
 		rec: heimdall.Recorder
@@ -1925,8 +1905,7 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 	// Part 4: Calling `recorder_flush` AFTER `recorder_set_enabled(&rec, false)` must still flush
 	// records emitted before disabling.
 	{
-		dis_prefix_buf: [512]byte
-		dis_prefix := fmt.bprintf(dis_prefix_buf[:], "%s_flush_after_disable", s.file_prefix)
+		dis_prefix := fmt.tprintf("%s_flush_after_disable", s.file_prefix)
 		defer driver_cleanup_segment_files(dis_prefix)
 
 		rec: heimdall.Recorder
@@ -1982,8 +1961,7 @@ driver_verify_partial_batch_oom_and_string_offset_overflow_rollback :: proc(
 		}
 
 		// Force `clone_string_pair` OOM by swapping `rec.allocator` to `mem.nil_allocator()` after init
-		oom_str_buf: [512]byte
-		oom_str_pfx := fmt.bprintf(oom_str_buf[:], "%s_clone_oom", s.file_prefix)
+		oom_str_pfx := fmt.tprintf("%s_clone_oom", s.file_prefix)
 		defer driver_cleanup_segment_files(oom_str_pfx)
 		rec_oom: heimdall.Recorder
 		if heimdall.recorder_init(&rec_oom, heimdall.Config{
@@ -2147,8 +2125,7 @@ driver_verify_live_flushes_under_continuous_producer_load :: proc(
 	zero_drops        = true
 
 	for mode, b_idx in backends {
-		load_buf: [512]byte
-		load_prefix := fmt.bprintf(load_buf[:], "%s_cont_flush_%d", s.file_prefix, b_idx)
+		load_prefix := fmt.tprintf("%s_cont_flush_%d", s.file_prefix, b_idx)
 		defer driver_cleanup_segment_files(load_prefix)
 
 		rec: heimdall.Recorder
