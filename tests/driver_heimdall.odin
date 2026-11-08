@@ -149,6 +149,9 @@ driver_configure_recorder :: proc(
 				return false
 			}
 			actor.scheduler_start(&s.shared_sched)
+			for intrinsics.atomic_load_explicit(&s.shared_sched.parked_workers, .Acquire) < u32(shared_scheduler_workers) {
+				intrinsics.cpu_relax()
+			}
 			s.shared_sched_active = true
 		}
 		var_sched = &s.shared_sched
@@ -371,8 +374,11 @@ driver_emit_events_with_live_temp_canary :: proc(
 
 @(private)
 Auto_Detect_Actor_State :: struct {
-	prefix: string,
-	policy: heimdall.Backpressure_Policy,
+	prefix:          string,
+	policy:          heimdall.Backpressure_Policy,
+	backend:         heimdall.Backend_Mode,
+	expected_sched:  ^actor.Scheduler,
+	expect_shared:   bool,
 }
 
 @(private)
@@ -383,15 +389,224 @@ auto_detect_actor_receive :: proc(ctx: ^actor.Context, state: ^Auto_Detect_Actor
 		batches_per_file = 1,
 		ring_page_count  = 2,
 		policy           = state.policy,
-		backend          = .Auto,
+		backend          = state.backend,
 	}) != nil {
 		actor.reply(ctx, int(-1))
 		return
 	}
 	resolved := int(rec.cfg.backend)
+	if state.expect_shared {
+		if rec._sched != state.expected_sched || rec._owned_sched || rec._worker != nil || rec._flusher_actor == nil {
+			resolved = -2
+		}
+	} else if rec.cfg.backend == .Dedicated_Thread {
+		if rec._worker == nil || rec._flusher_actor != nil {
+			resolved = -3
+		}
+	}
 	heimdall.event_emit(&rec, "auto_actor", "ping", i64(msg^), .Ok)
 	heimdall.recorder_destroy(&rec)
 	actor.reply(ctx, resolved)
+}
+
+driver_verify_auto_backend_selection_and_overrides :: proc(
+	s: ^Suite_Ctx,
+) -> (
+	os_thread_auto_mode:      heimdall.Backend_Mode,
+	actor_4w_block_auto_mode: heimdall.Backend_Mode,
+	actor_1w_block_auto_mode: heimdall.Backend_Mode,
+	actor_1w_drop_auto_mode:  heimdall.Backend_Mode,
+	thread_override_mode:     heimdall.Backend_Mode,
+	actor_override_mode:      heimdall.Backend_Mode,
+	persisted_segments:       int,
+) {
+	buf: [512]byte
+	auto_prefix := fmt.bprintf(buf[:], "%s_auto_matrix", s.file_prefix)
+	defer driver_cleanup_segment_files(auto_prefix)
+
+	// 1. Plain OS thread + `.Auto` -> `.Dedicated_Thread`
+	{
+		rec: heimdall.Recorder
+		if heimdall.recorder_init(&rec, heimdall.Config{
+			file_prefix      = auto_prefix,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			backend          = .Auto,
+		}) != nil {
+			return
+		}
+		if rec._worker != nil && rec._flusher_actor == nil {
+			os_thread_auto_mode = rec.cfg.backend
+		}
+		heimdall.event_emit(&rec, "auto_os", "ev", 1, .Ok)
+		heimdall.recorder_destroy(&rec)
+		flushed, _ := heimdall.recorder_diagnostics(&rec)
+		persisted_segments += int(flushed)
+		driver_cleanup_segment_files(auto_prefix)
+	}
+
+	// 2. Inside 4-worker `actor.Scheduler` handler + `.Auto` (`.Block`) -> `.Sleipnir_Actor` on shared `ctx.sched`
+	sched_4w: actor.Scheduler
+	if actor.scheduler_init_workers(&sched_4w, 4, true) != .None {
+		return
+	}
+	actor.scheduler_start(&sched_4w)
+	defer actor.scheduler_stop_and_destroy(&sched_4w)
+
+	{
+		probe_4w, err := actor.spawn(
+			&sched_4w,
+			Auto_Detect_Actor_State{
+				prefix         = auto_prefix,
+				policy         = .Block,
+				backend        = .Auto,
+				expected_sched = &sched_4w,
+				expect_shared  = true,
+			},
+			auto_detect_actor_receive,
+			911,
+		)
+		if err != .None || probe_4w == nil {
+			return
+		}
+		res := actor.call(&sched_4w, probe_4w, 10, int)
+		actor.destroy(probe_4w)
+		if res > 0 {
+			actor_4w_block_auto_mode = heimdall.Backend_Mode(res)
+			persisted_segments += 1
+		}
+		driver_cleanup_segment_files(auto_prefix)
+	}
+
+	// 3 & 4. Inside 1-worker `actor.Scheduler` handler:
+	//   - `.Auto` + `.Block` -> `.Dedicated_Thread` (offloads blocking disk I/O off lone worker)
+	//   - `.Auto` + `.Drop`  -> `.Sleipnir_Actor` (non-blocking producer shares 1-worker scheduler)
+	sched_1w: actor.Scheduler
+	if actor.scheduler_init_workers(&sched_1w, 1, true) != .None {
+		return
+	}
+	actor.scheduler_start(&sched_1w)
+	defer actor.scheduler_stop_and_destroy(&sched_1w)
+
+	{
+		probe_1w_block, err_b := actor.spawn(
+			&sched_1w,
+			Auto_Detect_Actor_State{
+				prefix         = auto_prefix,
+				policy         = .Block,
+				backend        = .Auto,
+				expected_sched = &sched_1w,
+				expect_shared  = false,
+			},
+			auto_detect_actor_receive,
+			912,
+		)
+		if err_b != .None || probe_1w_block == nil {
+			return
+		}
+		res_b := actor.call(&sched_1w, probe_1w_block, 20, int)
+		actor.destroy(probe_1w_block)
+		if res_b > 0 {
+			actor_1w_block_auto_mode = heimdall.Backend_Mode(res_b)
+			persisted_segments += 1
+		}
+		driver_cleanup_segment_files(auto_prefix)
+
+		probe_1w_drop, err_d := actor.spawn(
+			&sched_1w,
+			Auto_Detect_Actor_State{
+				prefix         = auto_prefix,
+				policy         = .Drop,
+				backend        = .Auto,
+				expected_sched = &sched_1w,
+				expect_shared  = true,
+			},
+			auto_detect_actor_receive,
+			913,
+		)
+		if err_d != .None || probe_1w_drop == nil {
+			return
+		}
+		res_d := actor.call(&sched_1w, probe_1w_drop, 30, int)
+		actor.destroy(probe_1w_drop)
+		if res_d > 0 {
+			actor_1w_drop_auto_mode = heimdall.Backend_Mode(res_d)
+			persisted_segments += 1
+		}
+		driver_cleanup_segment_files(auto_prefix)
+	}
+
+	// 5. Explicit `.Dedicated_Thread` override (both with `scheduler = &sched_4w` AND inside 4w actor handler)
+	{
+		probe_override, err_o := actor.spawn(
+			&sched_4w,
+			Auto_Detect_Actor_State{
+				prefix         = auto_prefix,
+				policy         = .Block,
+				backend        = .Dedicated_Thread,
+				expected_sched = nil,
+				expect_shared  = false,
+			},
+			auto_detect_actor_receive,
+			914,
+		)
+		if err_o != .None || probe_override == nil {
+			return
+		}
+		res_o := actor.call(&sched_4w, probe_override, 40, int)
+		actor.destroy(probe_override)
+		driver_cleanup_segment_files(auto_prefix)
+
+		rec_o: heimdall.Recorder
+		if heimdall.recorder_init(&rec_o, heimdall.Config{
+			file_prefix      = auto_prefix,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			backend          = .Dedicated_Thread,
+			scheduler        = &sched_4w,
+		}) != nil {
+			return
+		}
+		if res_o == int(heimdall.Backend_Mode.Dedicated_Thread) &&
+		   rec_o.cfg.backend == .Dedicated_Thread &&
+		   rec_o._worker != nil &&
+		   rec_o._flusher_actor == nil {
+			thread_override_mode = rec_o.cfg.backend
+		}
+		heimdall.event_emit(&rec_o, "override_os", "ev", 50, .Ok)
+		heimdall.recorder_destroy(&rec_o)
+		flushed, _ := heimdall.recorder_diagnostics(&rec_o)
+		persisted_segments += int(flushed)
+		driver_cleanup_segment_files(auto_prefix)
+	}
+
+	// 6. Explicit `.Sleipnir_Actor` override on plain OS thread (`scheduler = nil`) -> standalone owned 1-worker scheduler
+	{
+		rec_a: heimdall.Recorder
+		if heimdall.recorder_init(&rec_a, heimdall.Config{
+			file_prefix      = auto_prefix,
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			backend          = .Sleipnir_Actor,
+			scheduler        = nil,
+		}) != nil {
+			return
+		}
+		if rec_a.cfg.backend == .Sleipnir_Actor &&
+		   rec_a._owned_sched &&
+		   rec_a._sched != nil &&
+		   rec_a._flusher_actor != nil &&
+		   rec_a._worker == nil {
+			actor_override_mode = rec_a.cfg.backend
+		}
+		heimdall.event_emit(&rec_a, "override_actor", "ev", 60, .Ok)
+		heimdall.recorder_destroy(&rec_a)
+		flushed, _ := heimdall.recorder_diagnostics(&rec_a)
+		persisted_segments += int(flushed)
+		driver_cleanup_segment_files(auto_prefix)
+	}
+
+	return
 }
 
 driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
@@ -436,76 +651,6 @@ driver_cycle_sleipnir_actor_lifecycle_under_load :: proc(
 			iso_rec._sched != &s.shared_sched
 		heimdall.recorder_destroy(&iso_rec)
 		if !ambient_preserved {
-			return 0, 0
-		}
-	}
-
-	// Verify `Backend_Mode.Auto` runtime detection & explicit `.Dedicated_Thread` override:
-	//   1. `backend = .Auto` inside an actor handler on a 4-worker scheduler -> resolves to `.Sleipnir_Actor`
-	//   2. `backend = .Auto, policy = .Block` inside an actor handler on a 1-worker scheduler -> resolves to `.Dedicated_Thread`
-	//   3. `backend = .Dedicated_Thread` override with `scheduler = &s.shared_sched` -> forces `.Dedicated_Thread`
-	{
-		auto_buf: [512]byte
-		auto_prefix := fmt.bprintf(auto_buf[:], "%s_auto_detect", s.file_prefix)
-		defer driver_cleanup_segment_files(auto_prefix)
-
-		// 1. Inside 4-worker scheduler actor handler -> `.Sleipnir_Actor`
-		probe_4w, p4_err := actor.spawn(
-			&s.shared_sched,
-			Auto_Detect_Actor_State{prefix = auto_prefix, policy = .Block},
-			auto_detect_actor_receive,
-			901,
-		)
-		if p4_err != .None || probe_4w == nil {
-			return 0, 0
-		}
-		mode_4w := actor.call(&s.shared_sched, probe_4w, 1, int)
-		actor.destroy(probe_4w)
-		driver_cleanup_segment_files(auto_prefix)
-		if mode_4w != int(heimdall.Backend_Mode.Sleipnir_Actor) {
-			return 0, 0
-		}
-
-		// 2. Inside 1-worker scheduler actor handler with `.Block` policy -> `.Dedicated_Thread`
-		sched_1w: actor.Scheduler
-		if actor.scheduler_init_workers(&sched_1w, 1, true) != .None {
-			return 0, 0
-		}
-		actor.scheduler_start(&sched_1w)
-		probe_1w, p1_err := actor.spawn(
-			&sched_1w,
-			Auto_Detect_Actor_State{prefix = auto_prefix, policy = .Block},
-			auto_detect_actor_receive,
-			902,
-		)
-		if p1_err != .None || probe_1w == nil {
-			actor.scheduler_stop_and_destroy(&sched_1w)
-			return 0, 0
-		}
-		mode_1w := actor.call(&sched_1w, probe_1w, 2, int)
-		actor.destroy(probe_1w)
-		actor.scheduler_stop_and_destroy(&sched_1w)
-		driver_cleanup_segment_files(auto_prefix)
-		if mode_1w != int(heimdall.Backend_Mode.Dedicated_Thread) {
-			return 0, 0
-		}
-
-		// 3. Explicit `.Dedicated_Thread` override even when `scheduler != nil`
-		override_rec: heimdall.Recorder
-		if heimdall.recorder_init(&override_rec, heimdall.Config{
-			file_prefix      = auto_prefix,
-			batches_per_file = 1,
-			ring_page_count  = 2,
-			backend          = .Dedicated_Thread,
-			scheduler        = &s.shared_sched,
-		}) != nil {
-			return 0, 0
-		}
-		override_ok := (override_rec.cfg.backend == .Dedicated_Thread) &&
-			(override_rec._worker != nil) &&
-			(override_rec._flusher_actor == nil)
-		heimdall.recorder_destroy(&override_rec)
-		if !override_ok {
 			return 0, 0
 		}
 	}

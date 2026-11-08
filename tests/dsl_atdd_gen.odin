@@ -95,6 +95,7 @@ Suite_Ctx_VTable :: struct {
 	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(s: ^Suite_Ctx, expected_flushed_batches: int, loc := #caller_location),
 	then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema: proc(s: ^Suite_Ctx, expected_custom_schema_cols: int, loc := #caller_location),
 	then_live_flushes_complete_under_continuous_producer_load: proc(s: ^Suite_Ctx, producer_count: int, flush_calls: int, loc := #caller_location),
+	then_auto_backend_selection_and_overrides_resolve_correctly: proc(s: ^Suite_Ctx, expected_os_thread_auto: heimdall.Backend_Mode, expected_actor_4w_block_auto: heimdall.Backend_Mode, expected_actor_1w_block_auto: heimdall.Backend_Mode, expected_actor_1w_drop_auto: heimdall.Backend_Mode, expected_thread_override: heimdall.Backend_Mode, expected_actor_override: heimdall.Backend_Mode, expected_persisted_segments: int, loc := #caller_location),
 }
 
 @(private)
@@ -139,6 +140,7 @@ _suite_ctx_vtable := Suite_Ctx_VTable{
 	then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly = then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly,
 	then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema = then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema,
 	then_live_flushes_complete_under_continuous_producer_load = then_live_flushes_complete_under_continuous_producer_load,
+	then_auto_backend_selection_and_overrides_resolve_correctly = then_auto_backend_selection_and_overrides_resolve_correctly,
 }
 
 Given_DSL :: struct {
@@ -216,6 +218,7 @@ Then_DSL :: struct {
 	partial_batch_oom_and_string_offset_overflow_roll_back_cleanly: proc(expected_flushed_batches: int, loc := #caller_location),
 	ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema: proc(expected_custom_schema_cols: int, loc := #caller_location),
 	live_flushes_complete_under_continuous_producer_load: proc(producer_count: int, flush_calls: int, loc := #caller_location),
+	auto_backend_selection_and_overrides_resolve_correctly: proc(expected_os_thread_auto: heimdall.Backend_Mode, expected_actor_4w_block_auto: heimdall.Backend_Mode, expected_actor_1w_block_auto: heimdall.Backend_Mode, expected_actor_1w_drop_auto: heimdall.Backend_Mode, expected_thread_override: heimdall.Backend_Mode, expected_actor_override: heimdall.Backend_Mode, expected_persisted_segments: int, loc := #caller_location),
 }
 
 @(rodata)
@@ -238,6 +241,7 @@ then := Then_DSL{
 	partial_batch_oom_and_string_offset_overflow_roll_back_cleanly = then_partial_batch_oom_and_string_offset_overflow_roll_back_cleanly_ambient,
 	ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema = then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema_ambient,
 	live_flushes_complete_under_continuous_producer_load = then_live_flushes_complete_under_continuous_producer_load_ambient,
+	auto_backend_selection_and_overrides_resolve_correctly = then_auto_backend_selection_and_overrides_resolve_correctly_ambient,
 }
 
 // =============================================================================
@@ -398,5 +402,9 @@ then_ast_validates_unknown_dsl_steps_poly_codegen_and_custom_schema_ambient :: #
 
 then_live_flushes_complete_under_continuous_producer_load_ambient :: #force_inline proc(producer_count: int, flush_calls: int, loc := #caller_location) {
 	then_live_flushes_complete_under_continuous_producer_load(current_scenario(loc), producer_count, flush_calls, loc)
+}
+
+then_auto_backend_selection_and_overrides_resolve_correctly_ambient :: #force_inline proc(expected_os_thread_auto: heimdall.Backend_Mode, expected_actor_4w_block_auto: heimdall.Backend_Mode, expected_actor_1w_block_auto: heimdall.Backend_Mode, expected_actor_1w_drop_auto: heimdall.Backend_Mode, expected_thread_override: heimdall.Backend_Mode, expected_actor_override: heimdall.Backend_Mode, expected_persisted_segments: int, loc := #caller_location) {
+	then_auto_backend_selection_and_overrides_resolve_correctly(current_scenario(loc), expected_os_thread_auto, expected_actor_4w_block_auto, expected_actor_1w_block_auto, expected_actor_1w_drop_auto, expected_thread_override, expected_actor_override, expected_persisted_segments, loc)
 }
 

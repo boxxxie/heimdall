@@ -894,4 +894,26 @@ spec_live_flush_completes_under_continuous_multithreaded_producer_load :: proc(t
 	)
 }
 
+@(test)
+spec_auto_backend_selection_and_explicit_overrides_choose_optimal_engine :: proc(t: ^testing.T) {
+	_ = scenario(t)
+
+	// Verifies `Backend_Mode.Auto` (`0` default) and explicit `.Dedicated_Thread` / `.Sleipnir_Actor` overrides:
+	//   1. Plain OS thread + `.Auto` -> `.Dedicated_Thread`
+	//   2. Live 4-worker `actor.Scheduler` handler + `.Auto` (`.Block`) -> `.Sleipnir_Actor` attached to `ctx.sched`
+	//   3. Live 1-worker `actor.Scheduler` handler + `.Auto` (`.Block`) -> `.Dedicated_Thread` (offloads blocking disk I/O)
+	//   4. Live 1-worker `actor.Scheduler` handler + `.Auto` (`.Drop`)  -> `.Sleipnir_Actor` attached to `ctx.sched`
+	//   5. Explicit `.Dedicated_Thread` override (with `scheduler != nil` or inside actor handler) -> `.Dedicated_Thread`
+	//   6. Explicit `.Sleipnir_Actor` override on plain OS thread (`scheduler == nil`) -> `.Sleipnir_Actor` (`_owned_sched = true`)
+	then.auto_backend_selection_and_overrides_resolve_correctly(
+		expected_os_thread_auto      = .Dedicated_Thread,
+		expected_actor_4w_block_auto = .Sleipnir_Actor,
+		expected_actor_1w_block_auto = .Dedicated_Thread,
+		expected_actor_1w_drop_auto  = .Sleipnir_Actor,
+		expected_thread_override     = .Dedicated_Thread,
+		expected_actor_override      = .Sleipnir_Actor,
+		expected_persisted_segments  = 6,
+	)
+}
+
 

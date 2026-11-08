@@ -524,3 +524,26 @@ then_live_flushes_complete_under_continuous_producer_load :: proc(
 	testing.expect(s.t, flushes_ok, "Expected live `recorder_flush` calls to complete in bounded time under continuous producer load", loc = loc)
 	testing.expect(s.t, zero_drops, "Expected zero dropped records during live flushes under `.Block` policy", loc = loc)
 }
+
+then_auto_backend_selection_and_overrides_resolve_correctly :: proc(
+	s:                             ^Suite_Ctx,
+	expected_os_thread_auto:       heimdall.Backend_Mode,
+	expected_actor_4w_block_auto:  heimdall.Backend_Mode,
+	expected_actor_1w_block_auto:  heimdall.Backend_Mode,
+	expected_actor_1w_drop_auto:   heimdall.Backend_Mode,
+	expected_thread_override:      heimdall.Backend_Mode,
+	expected_actor_override:       heimdall.Backend_Mode,
+	expected_persisted_segments:   int,
+	loc := #caller_location,
+) {
+	os_auto, a4w_block, a1w_block, a1w_drop, t_ovr, a_ovr, segs :=
+		driver_verify_auto_backend_selection_and_overrides(s)
+
+	testing.expect_value(s.t, os_auto,   expected_os_thread_auto,      loc = loc)
+	testing.expect_value(s.t, a4w_block, expected_actor_4w_block_auto, loc = loc)
+	testing.expect_value(s.t, a1w_block, expected_actor_1w_block_auto, loc = loc)
+	testing.expect_value(s.t, a1w_drop,  expected_actor_1w_drop_auto,  loc = loc)
+	testing.expect_value(s.t, t_ovr,     expected_thread_override,     loc = loc)
+	testing.expect_value(s.t, a_ovr,     expected_actor_override,      loc = loc)
+	testing.expect_value(s.t, segs,      expected_persisted_segments,  loc = loc)
+}

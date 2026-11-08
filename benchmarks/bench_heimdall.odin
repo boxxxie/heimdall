@@ -791,7 +791,266 @@ run_sleipnir_actor_benchmarks :: proc() -> [7]Bench_Result {
 }
 
 // -----------------------------------------------------------------------------
-// 6. End-to-End Arrow IPC Disk Write & Columnar Readback Benchmark
+// 6. Automatic Backend Selection (`.Auto` vs Suboptimal Forced Overrides)
+// -----------------------------------------------------------------------------
+
+@(private)
+Auto_Actor_Churn_State :: struct {
+	prefixes:          ^[64]string,
+	mode:              heimdall.Backend_Mode,
+	resolved_backends: [64]heimdall.Backend_Mode,
+}
+
+@(private)
+Auto_Actor_Churn_Reply :: struct {
+	flushed: u64,
+	dropped: u64,
+}
+
+@(private)
+auto_actor_churn_receive :: proc(
+	ctx:   ^actor.Context,
+	state: ^Auto_Actor_Churn_State,
+	msg:   ^int,
+) {
+	reqs_per_cycle := msg^
+	var_flushed: u64
+	var_dropped: u64
+	for c in 0 ..< 64 {
+		rec: heimdall.Recorder
+		_ = heimdall.recorder_init(&rec, heimdall.Config{
+			file_prefix      = state.prefixes[c],
+			batches_per_file = 1,
+			ring_page_count  = 2,
+			policy           = .Block,
+			backend          = state.mode,
+		})
+		state.resolved_backends[c] = rec.cfg.backend
+		for i in 0 ..< reqs_per_cycle {
+			bench_http_request(&rec, c * reqs_per_cycle + i)
+		}
+		heimdall.recorder_flush(&rec)
+		heimdall.recorder_destroy(&rec)
+		flushed, dropped := heimdall.recorder_diagnostics(&rec)
+		var_flushed += flushed
+		var_dropped += dropped
+	}
+	actor.reply(ctx, Auto_Actor_Churn_Reply{flushed = var_flushed, dropped = var_dropped})
+}
+
+@(private)
+Auto_1W_Producer_State :: struct {
+	prefix: string,
+	mode:   heimdall.Backend_Mode,
+}
+
+@(private)
+auto_1w_producer_receive :: proc(
+	ctx:   ^actor.Context,
+	state: ^Auto_1W_Producer_State,
+	msg:   ^int,
+) {
+	total_reqs := msg^
+	rec: heimdall.Recorder
+	_ = heimdall.recorder_init(&rec, heimdall.Config{
+		file_prefix      = state.prefix,
+		batches_per_file = 4,
+		ring_page_count  = 8,
+		policy           = .Block,
+		backend          = state.mode,
+	})
+	acc: u64 = 0xcbf29ce484222325
+	for i in 0 ..< total_reqs {
+		// Simulate lightweight per-request actor business logic (~150 ns CPU work)
+		// alongside telemetry emission so `.Dedicated_Thread` can overlap disk I/O
+		// in parallel while forced `.Sleipnir_Actor` on a 1-worker scheduler serializes both.
+		h := acc ~ u64(i)
+		for _ in 0 ..< 48 {
+			h = (h ~ (h >> 30)) * 0xbf58476d1ce4e5b9
+		}
+		acc = h
+		bench_http_request(&rec, int(h & 0x7fff_ffff))
+	}
+	g_sink_u64 += acc
+	heimdall.recorder_flush(&rec)
+	heimdall.recorder_destroy(&rec)
+	flushed, dropped := heimdall.recorder_diagnostics(&rec)
+	actor.reply(ctx, Auto_Actor_Churn_Reply{flushed = flushed, dropped = dropped})
+}
+
+run_auto_backend_benchmarks :: proc() -> [6]Bench_Result {
+	results: [6]Bench_Result
+
+	TOTAL_REQS :: 64_000
+	TOTAL_RECS :: TOTAL_REQS * 4 // 256,000 records (64 full 4096-row pages)
+
+	// Regime 1 (Actor-Handler Lifecycle Churn x64 on 4-Worker Scheduler):
+	// Compare forced `.Dedicated_Thread` (spawns/joins 64 OS threads) vs `.Auto` (attaches to `ctx.sched` in-process)
+	{
+		CYCLES         :: 64
+		REQS_PER_CYCLE :: TOTAL_REQS / CYCLES // 1,000 HTTP requests (4,000 records) per lifecycle cycle
+
+		for pair_idx in 0 ..< 2 {
+			mode: heimdall.Backend_Mode = .Dedicated_Thread if pair_idx == 0 else .Auto
+			label := "Forced .Dedicated_Thread in 4w actor (x64)" if pair_idx == 0 else ".Auto in 4w actor (-> .Sleipnir_Actor x64)"
+
+			sched: actor.Scheduler
+			_ = actor.scheduler_init_workers(&sched, 4, true)
+			actor.scheduler_start(&sched)
+
+			prefixes: [CYCLES]string
+			for c in 0 ..< CYCLES {
+				prefixes[c] = next_bench_prefix()
+			}
+
+			churn_actor, _ := actor.spawn(
+				&sched,
+				Auto_Actor_Churn_State{
+					prefixes = &prefixes,
+					mode     = mode,
+				},
+				auto_actor_churn_receive,
+				u32(800 + pair_idx),
+			)
+
+			t0 := time.tick_now()
+			rep := actor.call(&sched, churn_actor, int(REQS_PER_CYCLE), Auto_Actor_Churn_Reply)
+			elapsed := time.tick_since(t0)
+
+			actor.destroy(churn_actor)
+			actor.scheduler_stop_and_destroy(&sched)
+			for c in 0 ..< CYCLES {
+				cleanup_arrow_segments(prefixes[c])
+			}
+
+			results[pair_idx] = make_bench_result(
+				label,
+				TOTAL_RECS,
+				elapsed,
+				rep.flushed,
+				rep.dropped,
+				0,
+				0,
+			)
+		}
+	}
+
+	// Regime 2 (1-Worker Actor Scheduler under `.Block` Policy):
+	// Compare forced `.Sleipnir_Actor` (serializes actor CPU + blocking disk I/O on lone worker)
+	// vs `.Auto` (detects `num_workers == 1 && policy == .Block` and offloads I/O to `.Dedicated_Thread` in parallel)
+	{
+		for pair_idx in 0 ..< 2 {
+			mode: heimdall.Backend_Mode = .Sleipnir_Actor if pair_idx == 0 else .Auto
+			label := "Forced .Sleipnir_Actor on 1w sched (.Block)" if pair_idx == 0 else ".Auto on 1w sched (.Block -> .Dedicated_Thread)"
+
+			prefix := next_bench_prefix()
+			sched: actor.Scheduler
+			_ = actor.scheduler_init_workers(&sched, 1, false)
+			actor.scheduler_start(&sched)
+
+			prod_actor, _ := actor.spawn(
+				&sched,
+				Auto_1W_Producer_State{prefix = prefix, mode = mode},
+				auto_1w_producer_receive,
+				u32(810 + pair_idx),
+			)
+
+			t0 := time.tick_now()
+			rep := actor.call(&sched, prod_actor, int(TOTAL_REQS), Auto_Actor_Churn_Reply)
+			elapsed := time.tick_since(t0)
+
+			actor.destroy(prod_actor)
+			actor.scheduler_stop_and_destroy(&sched)
+			cleanup_arrow_segments(prefix)
+
+			results[2 + pair_idx] = make_bench_result(
+				label,
+				TOTAL_RECS,
+				elapsed,
+				rep.flushed,
+				rep.dropped,
+				0,
+				0,
+			)
+		}
+	}
+
+	// Regime 3 (Plain OS Thread Producer with Default Config):
+	// Compare forced `.Sleipnir_Actor` on a plain OS thread vs `.Auto` (selects `.Dedicated_Thread`)
+	{
+		for pair_idx in 0 ..< 2 {
+			mode: heimdall.Backend_Mode = .Sleipnir_Actor if pair_idx == 0 else .Auto
+			label := "Forced .Sleipnir_Actor on OS thread" if pair_idx == 0 else ".Auto on OS thread (-> .Dedicated_Thread)"
+
+			prefix := next_bench_prefix()
+			rec: heimdall.Recorder
+			_ = heimdall.recorder_init(&rec, heimdall.Config{
+				file_prefix      = prefix,
+				batches_per_file = 4,
+				ring_page_count  = 8,
+				policy           = .Block,
+				backend          = mode,
+			})
+
+			t0 := time.tick_now()
+			for i in 0 ..< TOTAL_REQS {
+				bench_http_request(&rec, i)
+			}
+			heimdall.recorder_flush(&rec)
+			heimdall.recorder_destroy(&rec)
+			elapsed := time.tick_since(t0)
+
+			cleanup_arrow_segments(prefix)
+			flushed, dropped := heimdall.recorder_diagnostics(&rec)
+
+			results[4 + pair_idx] = make_bench_result(
+				label,
+				TOTAL_RECS,
+				elapsed,
+				flushed,
+				dropped,
+				0,
+				0,
+			)
+		}
+	}
+
+	return results
+}
+
+@(private)
+print_auto_speedup_summary :: proc(results: []Bench_Result) {
+	if len(results) < 6 {
+		return
+	}
+	fmt.println("\n#### `.Auto` Speedup Summary vs Suboptimal Forced Backend\n")
+	fmt.println("| Regime | Suboptimal Forced Backend | `.Auto` Selected Backend | Latency Delta | Throughput Speedup |")
+	fmt.println("| :--- | :--- | :--- | ---: | ---: |")
+	regimes := [3]string{
+		"4-Worker Actor Lifecycle Churn (x64)",
+		"1-Worker Actor Scheduler (CPU + Disk `.Block`)",
+		"Plain OS Thread Producer (8-Page `.Block`)",
+	}
+	for i in 0 ..< 3 {
+		forced := results[i * 2]
+		auto_r := results[i * 2 + 1]
+		speedup := forced.elapsed_ms / max(auto_r.elapsed_ms, 0.001)
+		fmt.printf(
+			"| %s | `%.2f ns/rec` (`%.2f ms`) | `%.2f ns/rec` (`%.2f ms`) | `%.2f -> %.2f ns` | **%.2fx** |\n",
+			regimes[i],
+			forced.ns_per_record,
+			forced.elapsed_ms,
+			auto_r.ns_per_record,
+			auto_r.elapsed_ms,
+			forced.ns_per_record,
+			auto_r.ns_per_record,
+			speedup,
+		)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 7. End-to-End Arrow IPC Disk Write & Columnar Readback Benchmark
 // -----------------------------------------------------------------------------
 
 Arrow_IO_Report :: struct {
@@ -966,8 +1225,12 @@ main :: proc() {
 	sleipnir_bench := run_sleipnir_actor_benchmarks()
 	print_section_table("5. Sleipnir Actor Backend vs Dedicated Worker Thread (256,000 Records)", sleipnir_bench[:])
 
+	auto_bench := run_auto_backend_benchmarks()
+	print_section_table("6. Automatic Backend Selection (`.Auto` vs Suboptimal Forced Overrides, 256,000 Records)", auto_bench[:])
+	print_auto_speedup_summary(auto_bench[:])
+
 	io_rep := run_arrow_io_roundtrip_benchmark()
-	fmt.println("\n### 6. End-to-End `.arrow` IPC Segment Disk Write & `OdinArrow` Readback")
+	fmt.println("\n### 7. End-to-End `.arrow` IPC Segment Disk Write & `OdinArrow` Readback")
 	fmt.println()
 	fmt.println("| Metric | Value |")
 	fmt.println("| :--- | ---: |")

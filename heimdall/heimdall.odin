@@ -364,15 +364,19 @@ resolve_ideal_backend :: proc(cfg: Config) -> (mode: Backend_Mode, sched: ^actor
 	if cfg.backend == .Dedicated_Thread {
 		return .Dedicated_Thread, nil
 	}
-	if cfg.scheduler != nil {
-		return .Sleipnir_Actor, cfg.scheduler
-	}
-	ctx := actor.current_context()
-	if ctx != nil && ctx.sched != nil && ctx.sched.started &&
-	   intrinsics.atomic_load_explicit(&ctx.sched.running, .Acquire) {
-		if cfg.backend == .Sleipnir_Actor || ctx.sched.num_workers >= 2 || cfg.policy == .Drop {
-			return .Sleipnir_Actor, ctx.sched
+	target_sched := cfg.scheduler
+	if target_sched == nil {
+		ctx := actor.current_context()
+		if ctx != nil && ctx.sched != nil && ctx.sched.started &&
+		   intrinsics.atomic_load_explicit(&ctx.sched.running, .Acquire) {
+			target_sched = ctx.sched
 		}
+	}
+	if target_sched != nil {
+		if cfg.backend == .Sleipnir_Actor || target_sched.num_workers >= 2 || cfg.policy == .Drop {
+			return .Sleipnir_Actor, target_sched
+		}
+		return .Dedicated_Thread, nil
 	}
 	if cfg.backend == .Sleipnir_Actor {
 		return .Sleipnir_Actor, nil
