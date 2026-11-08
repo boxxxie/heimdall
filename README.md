@@ -1,5 +1,7 @@
 # Heimdall
 
+[![CI](https://github.com/boxxxie/heimdall/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/heimdall/actions/workflows/ci.yml)
+
 **Heimdall** is a high-throughput, low-latency telemetry ingestion engine for [Odin](https://odin-lang.org/), backed by `#soa` staging ring pages, zero-copy [OdinArrow](https://arrow.apache.org/) IPC columnar persistence, and adaptive background execution via either a dedicated OS worker thread or a [Sleipnir](https://odin-lang.org/) actor scheduler.
 
 Heimdall is designed so that third-party Odin libraries and applications can instrument hot paths with spans, counters, gauges, histograms, and events at nanosecond overhead—dropping to a zero-allocation no-op when disabled or passed a `nil` recorder.

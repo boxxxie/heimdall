@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
+
+      - name: Run AST Metaprogramming Codegen & Verify Zero Drift
+        run: |
+          odin run tools/heimdall_gen -vet -strict-style -vet-tabs -vet-packages:main,heimdall_codegen -- tests
+          git diff --exit-code heimdall/schema_gen.odin tests/dsl_atdd_gen.odin
+
+      - name: Type-check Heimdall library & codegen packages
+        run: |
+          odin check heimdall -no-entry-point -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall
+          odin check heimdall/codegen -no-entry-point -vet -strict-style -vet-tabs -vet-packages:heimdall_codegen
+
+      - name: Run 4-layer ATDD specification suite (with memory leak detection)
+        run: |
+          odin test tests -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_tests,heimdall,heimdall_codegen
+
+      - name: Verify package documentation generation
+        run: |
+          odin doc heimdall -custom-attribute:telemetry_schema > /dev/null
+
+      - name: Type-check benchmark suite
+        run: |
+          odin check benchmarks -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
