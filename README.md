@@ -10,7 +10,7 @@ Heimdall is designed so that third-party Odin libraries and applications can ins
 
 ## Key Features
 
-* **Zero-Cost When Disabled or `nil`:** Passing `nil` or a disabled `^heimdall.Recorder` short-circuits before reading clocks or acquiring locks ($0\text{ B}$ allocations).
+* **Zero-Cost When Disabled or `nil`:** Passing `nil` or a disabled `^heimdall.Recorder` short-circuits before reading clocks or acquiring locks (`0 B` allocations).
 * **`#soa` Columnar Staging Ring:** Producers write directly into cache-line-isolated `#soa[4096]Record` (`BATCH_CAP :: 4096`) staging pages, eliminating AoS-to-SoA transposition during Apache Arrow serialization.
 * **Single-Line Scoped RAII Spans:** `@(deferred_out = span_end)` on `heimdall.scoped_span` automatically captures monotonic duration, links nested cross-library calls via thread-local `parent_id -> span_id` trees, and emits the span when the enclosing lexical scope exits.
 * **Multi-Recorder & Cooperative Actor Turn Isolation:** Thread-local active span slots are keyed by `(Recorder, _instance_id, actor_env)` (`MAX_TLS_RECORDERS :: 16`) with batched 64-ID reservations (`SPAN_ID_BATCH_SIZE :: 64`), preventing cross-recorder or cooperative `actor.call` parent-span pollution on shared OS worker threads.
@@ -114,7 +114,7 @@ Heimdall persists `.arrow` IPC files with 11 canonical OpenTelemetry-compatible 
 | `6` | `status` | `Status` (`u8`) | `UInt8` | `Ok (0)`, `Error (1)` |
 | `7` | `scope` | `string` | `String` | Library or subsystem name (e.g., `"net.http"`, `"db.driver"`) |
 | `8` | `name` | `string` | `String` | Operation or metric name (e.g., `"handle_request"`, `"requests_total"`) |
-| `9` | `value_f64` | `f64` | `Float64` | Metric value/delta/sample, or convenience span duration in milliseconds ($\text{duration\_ns} / 10^6$) |
+| `9` | `value_f64` | `f64` | `Float64` | Metric value/delta/sample, or convenience span duration in milliseconds (`f64(duration_ns) / 1e6`) |
 | `10` | `attr_i64` | `i64` | `Int64` | Secondary integer attribute (payload bytes, query ID, HTTP status code, entity ID) |
 
 ---

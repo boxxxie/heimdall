@@ -83,7 +83,7 @@ The test suite enforces a strict **4-Layer Acceptance Test-Driven Development (A
 2. **Layer 2 — Domain-Specific Language (`tests/dsl_heimdall.odin`):**
    * Define `given_*`, `upon_*`, and `then_*` procedures taking `(s: ^Suite_Ctx, ..., loc := #caller_location)`.
    * Translate domain assertions into `driver_*` calls and `testing.expect*` checks forwarding `loc = loc`.
-   * Every DSL step defined in `dsl_heimdall.odin` **MUST** be called by at least one `@(test)` scenario in `spec_*.odin` ($0$ unused DSL procedures allowed).
+   * Every DSL step defined in `dsl_heimdall.odin` **MUST** be called by at least one `@(test)` scenario in `spec_*.odin` (`0` unused DSL procedures allowed).
 3. **Layer 3 — Protocol Driver (`tests/driver_heimdall.odin`):**
    * The **ONLY** test layer allowed to import `OdinArrow`, `sleipnir/actor`, `heimdall/codegen`, and `heimdall` internals, or manage `.arrow` files on disk.
 4. **Layer 4 — System Under Test (`heimdall/`):**

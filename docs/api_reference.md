@@ -177,7 +177,7 @@ span_set_error :: #force_inline proc(
 )
 ```
 * When a span is active on `(r, current_actor_env())`, any nested `scoped_span`, `span_begin`, `counter_add`, `gauge_set`, `histogram_record`, or `event_emit` on the same thread and recorder automatically sets its `parent_id` to the active `span_id`.
-* When a `.Span` record is written, `duration_ns` holds the monotonic duration in nanoseconds and `value_f64` holds the duration in milliseconds ($\text{duration\_ns} / 10^6$).
+* When a `.Span` record is written, `duration_ns` holds the monotonic duration in nanoseconds and `value_f64` holds the duration in milliseconds (`f64(duration_ns) / 1e6`).
 
 ### Point Metrics & Events
 ```odin
@@ -203,7 +203,7 @@ decode_string_from_buffers :: #force_inline proc(
 	row_idx:    int,
 ) -> string
 ```
-`record_batch_reader_resolve` validates all 11 columns, checks buffer lengths and non-zero `Array.offset` slices, and caches typed multi-pointers (`reader.timestamp_ns_data`, `reader.attr_i64_data`, etc.) for $O(1)$ row decoding.
+`record_batch_reader_resolve` validates all 11 columns, checks buffer lengths and non-zero `Array.offset` slices, and caches typed multi-pointers (`reader.timestamp_ns_data`, `reader.attr_i64_data`, etc.) for `O(1)` row decoding.
 
 ---
 

@@ -15,7 +15,7 @@ To prevent false sharing between high-frequency producer threads and the backgro
 4. **Zone 4 (Background Worker / Actor State):** `_flushed_segments`, `_failed_segments`, `_eng` (`Flusher_Engine`), `_worker`, `_sched`, and `_flusher_actor`.
 
 ### 1.2 `#soa` Staging Pages & Two-Phase Commit
-Each `Staging_Page` (`#align(64)`) holds `#soa[4096]Record` (`BATCH_CAP :: 4096`, $\approx 344\text{ KB}$ per page):
+Each `Staging_Page` (`#align(64)`) holds `#soa[4096]Record` (`BATCH_CAP :: 4096`, `~344 KB` per page):
 ```odin
 Staging_Page :: struct #align(64) {
 	rows:      #soa[]Record,
@@ -38,7 +38,11 @@ Instrumenting nested library calls without passing a `Span_Context` parameter th
 2. **Cooperative Sleipnir `actor.call` on One Worker Thread:** Actor A opens a `scoped_span` and invokes `actor.call(sched, actor_b, msg)`. On a 1-worker scheduler, `actor.call` cooperatively steps Actor B on the **same OS thread** while Actor A's stack frame is suspended.
 
 Heimdall solves both by indexing `tls_recorder_spans: [MAX_TLS_RECORDERS]TLS_Recorder_Span` by the 3-tuple:
-$$(\text{recorder pointer}, \text{recorder } \_instance\_id, \text{actor\_env pointer})$$
+
+```text
+(recorder, recorder_id, actor_env)
+```
+
 where `actor_env` is read from `actor.current_context().current_env`.
 * Actor B's message turn has a distinct `current_env` pointer from Actor A's suspended turn, so Actor B starts a clean root span (`parent_id == 0`) without inheriting Actor A's open span.
 * Including `_instance_id` ensures that if a `Recorder` is destroyed and a new `Recorder` is re-initialized at the exact same memory address, stale `tls_span_id_cache` entries and stale `Span_Guard` values from the prior lifecycle generation are never confused with the new instance.
