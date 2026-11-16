@@ -251,8 +251,24 @@ current_tid :: #force_inline proc() -> u32 {
 	return tid
 }
 
+when ODIN_TEST {
+	@(thread_local)
+	_test_actor_env_override: rawptr
+
+	test_set_actor_env_override :: proc(env: rawptr) -> rawptr {
+		prev := _test_actor_env_override
+		_test_actor_env_override = env
+		return prev
+	}
+}
+
 @(private)
 current_actor_env :: #force_inline proc() -> rawptr {
+	when ODIN_TEST {
+		if _test_actor_env_override != nil {
+			return _test_actor_env_override
+		}
+	}
 	ctx := actor.current_context()
 	if ctx != nil {
 		return ctx.current_env
