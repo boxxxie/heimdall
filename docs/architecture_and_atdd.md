@@ -7,7 +7,7 @@ This document explains Heimdall's internal memory layout, lock-free/low-lock con
 ## 1. Memory Layout & Cache-Line Isolation
 
 ### 1.1 `Recorder` Cache-Line Zones
-To prevent false sharing between high-frequency producer threads and the background `OdinArrow` serializer, `Recorder` (`#align(64)`) is divided into four cache-line-isolated zones separated by explicit `[64]u8` padding (`_pad0`, `_pad1`, `_pad2`):
+To prevent false sharing between high-frequency producer threads and the background `Skadi` serializer, `Recorder` (`#align(64)`) is divided into four cache-line-isolated zones separated by explicit `[64]u8` padding (`_pad0`, `_pad1`, `_pad2`):
 
 1. **Zone 1 (Read-Mostly Configuration & Allocators):** `enabled`, `_instance_id`, `epoch_offset_ns`, `allocator`, `cfg`, and the `_pages` slice header. Shared across all CPU cores in the Shared (S) MESI state during normal ingestion.
 2. **Zone 2 (Producer-Consumer Ring State):** `_mu`, `_active_page_idx`, `_free_stack`, `_ready_ring`, condition variables (`_cv_work_ready`, `_cv_page_free`, `_cv_flush_done`, `_cv_actor_idle`), and `_alloc_mu`.
@@ -75,7 +75,7 @@ Heimdall's test suite (`tests/`) follows Dave Farley's **4-Layer Acceptance Test
 │   - `tools/heimdall_gen` generates `tests/dsl_atdd_gen.odin`              │
 ├───────────────────────────────────────────────────────────────────────────┤
 │ Layer 3: Protocol Driver (`tests/driver_heimdall.odin`)                   │
-│   - Owns `Suite_Ctx`, `heimdall.Recorder`, `OdinArrow` IPC reader,        │
+│   - Owns `Suite_Ctx`, `heimdall.Recorder`, `Skadi` IPC reader,            │
 │     `sleipnir/actor` schedulers, and `.tmp/*.arrow` file cleanup          │
 ├───────────────────────────────────────────────────────────────────────────┤
 │ Layer 4: System Under Test (`heimdall/`)                                  │

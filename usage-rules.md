@@ -73,7 +73,7 @@ This file defines mandatory usage rules, idioms, and architectural constraints f
 The test suite enforces a strict **4-Layer Acceptance Test-Driven Development (ATDD)** architecture verified by `spec_ast_architecture.odin`:
 
 1. **Layer 1 — Executable Specifications (`tests/spec_*.odin`):**
-   * **ONLY** import `"core:testing"`. Importing `heimdall`, `OdinArrow`, `sleipnir`, or `core:os` is **forbidden**.
+   * **ONLY** import `"core:testing"`. Importing `heimdall`, `skadi`, `sleipnir`, or `core:os` is **forbidden**.
    * **ONLY** declare `@(test)` procedures. Helper procedures or file-scope constants in `spec_*.odin` are **forbidden**.
    * **ALWAYS** begin a scenario with `_ = scenario(t)` or `s := scenario(t)`.
    * **ONLY** call Layer 2 DSL steps via `given.<step>(...)`, `upon.<step>(...)`, `then.<step>(...)`, or `s-><step>(...)`.
@@ -85,7 +85,7 @@ The test suite enforces a strict **4-Layer Acceptance Test-Driven Development (A
    * Translate domain assertions into `driver_*` calls and `testing.expect*` checks forwarding `loc = loc`.
    * Every DSL step defined in `dsl_heimdall.odin` **MUST** be called by at least one `@(test)` scenario in `spec_*.odin` (`0` unused DSL procedures allowed).
 3. **Layer 3 — Protocol Driver (`tests/driver_heimdall.odin`):**
-   * The **ONLY** test layer allowed to import `OdinArrow`, `sleipnir/actor`, `heimdall/codegen`, and `heimdall` internals, or manage `.arrow` files on disk.
+   * The **ONLY** test layer allowed to import `skadi`, `sleipnir/actor`, `heimdall/codegen`, and `heimdall` internals, or manage `.arrow` files on disk.
 4. **Layer 4 — System Under Test (`heimdall/`):**
    * Core telemetry engine and AST codegen packages.
 

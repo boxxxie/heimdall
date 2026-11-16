@@ -25,7 +25,7 @@ import "core:strings"
 //      `Upon_DSL`, `Then_DSL`) and `<step>_ambient` procedures preserving
 //      `#caller_location` and default parameter values
 // 3. Static AST Purity Linter (`analyze_atdd_sources` / `analyze_atdd_directories`):
-//    - Rejects forbidden `OdinArrow`, `sleipnir`, and `heimdall` imports in Layer 1 (`spec_*.odin`)
+//    - Rejects forbidden `skadi`, `sleipnir`, and `heimdall` imports in Layer 1 (`spec_*.odin`)
 //    - Rejects non-`@(test)` procedures and direct `heimdall.*` or `driver_*` calls in Layer 1
 //    - Rejects raw `testing.expect*` calls in Layer 1 `@(test)` scenario procs
 //    - Rejects zero-argument "Macro Theater" `upon` / `then` steps in Layer 1 & Layer 2

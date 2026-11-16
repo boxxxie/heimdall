@@ -6,7 +6,7 @@ import "core:testing"
 // Layer 1: Executable Specifications (`tests/spec_telemetry_hierarchy_and_lifecycle.odin`)
 //
 // Written purely in the domain DSL (`given.*`, `upon.*`, `then.*` and `s->step`).
-// Zero `OdinArrow` imports, zero direct `heimdall.*` calls, zero `testing.expect*` calls.
+// Zero `skadi` imports, zero direct `heimdall.*` calls, zero `testing.expect*` calls.
 // =============================================================================
 
 @(test)
@@ -694,7 +694,7 @@ spec_failed_arrow_file_write_frees_batches_without_incrementing_flushed_segments
 	_ = scenario(t)
 
 	// Point `file_prefix` at a non-existent directory so `oa.ipc_write_file` returns `false`.
-	// `flusher_engine_flush_segment` must free all `OdinArrow` batches cleanly and keep `flushed_segments == 0`.
+	// `flusher_engine_flush_segment` must free all `Skadi` batches cleanly and keep `flushed_segments == 0`.
 	given.recorder_configured(
 		batches_per_file = 1,
 		ring_pages       = 2,

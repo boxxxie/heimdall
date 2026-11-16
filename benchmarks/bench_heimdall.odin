@@ -9,8 +9,8 @@
 //   4. Nested cross-library call trees (2-level HTTP->DB & 3-level Gateway->Orders->DB)
 //   5. Static strings (`string_fallback_copy = false`) vs dynamic string cloning (`true`)
 //   6. Saturation backpressure policies (`.Drop` real-time loop vs `.Block` lossless)
-//   7. Multi-threaded producer scaling (1, 2, 4, 8 OS threads -> 1 OdinArrow worker)
-//   8. End-to-end `.arrow` IPC segment flush & `OdinArrow` columnar readback speed
+//   7. Multi-threaded producer scaling (1, 2, 4, 8 OS threads -> 1 Skadi worker)
+//   8. End-to-end `.arrow` IPC segment flush & `Skadi` columnar readback speed
 //
 // Run via:
 //   odin run benchmarks -o:speed -no-bounds-check
@@ -28,7 +28,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import "../heimdall"
-import oa "../deps/OdinArrow/src"
+import oa "../deps/skadi/skadi"
 import actor "../deps/sleipnir/actor"
 
 Bench_Result :: struct {
@@ -1097,7 +1097,7 @@ run_arrow_io_roundtrip_benchmark :: proc() -> Arrow_IO_Report {
 	heimdall.recorder_destroy(&rec)
 	write_elapsed := time.tick_since(t_write0)
 
-	// Measure OdinArrow `ipc_read_file` columnar scan across all 4 `.arrow` segment files
+	// Measure Skadi `ipc_read_file` columnar scan across all 4 `.arrow` segment files
 	t_read0   := time.tick_now()
 	rows_read := 0
 	checksum: i64 = 0
@@ -1204,7 +1204,7 @@ print_section_table :: proc(title: string, results: []Bench_Result) {
 
 main :: proc() {
 	fmt.println("=============================================================================================")
-	fmt.println(" Heimdall Telemetry Benchmark Suite (`#soa` Ring + Single-Threaded OdinArrow IPC Worker)")
+	fmt.println(" Heimdall Telemetry Benchmark Suite (`#soa` Ring + Single-Threaded Skadi IPC Worker)")
 	fmt.println("=============================================================================================")
 	fmt.printfln("  size_of(heimdall.Record)     : %d bytes (11 canonical OpenTelemetry columns)", size_of(heimdall.Record))
 	fmt.printfln("  size_of(heimdall.Span_Guard) : %d bytes (stack-only RAII `@(deferred_out)` guard)", size_of(heimdall.Span_Guard))
@@ -1235,7 +1235,7 @@ main :: proc() {
 	print_auto_speedup_summary(auto_bench[:])
 
 	io_rep := run_arrow_io_roundtrip_benchmark()
-	fmt.println("\n### 7. End-to-End `.arrow` IPC Segment Disk Write & `OdinArrow` Readback")
+	fmt.println("\n### 7. End-to-End `.arrow` IPC Segment Disk Write & `Skadi` Readback")
 	fmt.println()
 	fmt.println("| Metric | Value |")
 	fmt.println("| :--- | ---: |")

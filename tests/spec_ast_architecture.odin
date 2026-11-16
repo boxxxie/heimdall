@@ -14,7 +14,7 @@ spec_ast_parser_enforces_four_layer_atdd_architecture_and_codegen_sync :: proc(t
 	// 1. Parse every `.odin` file in `tests/` and `heimdall/` into Odin ASTs
 	//    (`core:odin/parser` + `core:odin/ast` + `ast.walk`) and verify:
 	//    - `tests/dsl_atdd_gen.odin` matches the live AST codegen output from `tests/dsl_heimdall.odin`
-	//    - Every `tests/spec_*.odin` file has zero forbidden `OdinArrow` imports
+	//    - Every `tests/spec_*.odin` file has zero forbidden `skadi` imports
 	//    - Every `@(scenario)` procedure in `tests/spec_*.odin` has zero direct `heimdall.*` or `driver_*` calls
 	//    - Every `@(scenario)` procedure in `tests/spec_*.odin` has zero raw `testing.expect*` calls
 	//    - Every `upon.*` / `then.*` call in `tests/spec_*.odin` passes explicit domain arguments (no 0-arg mega-steps)
@@ -30,7 +30,7 @@ package heimdall_tests
 import "core:testing"
 import "core:os"
 import "../heimdall"
-import oa "../deps/OdinArrow/src"
+import oa "../deps/skadi/skadi"
 
 forbidden_file_const :: 42
 
@@ -64,7 +64,7 @@ then_opaque_mega_step :: proc(s: ^Suite_Ctx) {
 		expected_testing_calls  = 1,
 		expected_zero_arg_steps = 2, // 1 in dsl decl + 1 at spec call site
 		expected_driver_leaks   = 4, // s.rec_active in helper + drv.rec (x2) + current_scenario().rec_active
-		expected_forbidden_imps = 3, // "core:os" + "../heimdall" + "../deps/OdinArrow/src"
+		expected_forbidden_imps = 3, // "core:os" + "../heimdall" + "../deps/skadi/skadi"
 		expected_do_statements  = 1,
 	)
 

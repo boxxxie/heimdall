@@ -13,13 +13,13 @@ import "core:thread"
 import "core:time"
 import "../heimdall"
 import codegen "../heimdall/codegen"
-import oa "../deps/OdinArrow/src"
+import oa "../deps/skadi/skadi"
 import actor "../deps/sleipnir/actor"
 
 // =============================================================================
 // Layer 3: Protocol Driver (`tests/driver_heimdall.odin`)
 //
-// The ONLY test layer that imports `OdinArrow` or directly manipulates
+// The ONLY test layer that imports `Skadi` or directly manipulates
 // `heimdall.Recorder`, `.arrow` IPC files, schemas, and record batches.
 // =============================================================================
 
@@ -1639,7 +1639,7 @@ driver_run_concurrent_dynamic_string_producers :: proc(
 
 	// Unsynchronized `mem.Arena` has zero internal locks; `Recorder._alloc_mu`
 	// must serialize concurrent producer `clone_string_pair` calls and worker
-	// `free_page_strings` / `OdinArrow` buffer allocations.
+	// `free_page_strings` / `Skadi` buffer allocations.
 	arena: mem.Arena
 	mem.arena_init(&arena, backing)
 	arena_alloc := mem.arena_allocator(&arena)
@@ -2069,10 +2069,10 @@ spec_uses_poly_and_variadic :: proc(t: ^testing.T) {
 		strings.contains(poly_code, "..tags, loc = loc") &&
 		!strings.contains(poly_code, `"core:time"`)
 
-	// 3. Custom `@(telemetry_schema)` struct codegen (including custom `import oa "odinarrow"` preservation)
+	// 3. Custom `@(telemetry_schema)` struct codegen (including custom `import oa "skadi"` preservation)
 	custom_schema_src :: `
 package custom_telemetry
-import oa "odinarrow"
+import oa "skadi"
 State_Kind :: enum u8 { Idle = 0, Active = 1 }
 @(telemetry_schema)
 Custom_Tick :: struct {
@@ -2088,7 +2088,7 @@ Custom_Tick :: struct {
 		context.temp_allocator,
 	)
 	if schema_ok &&
-		strings.contains(schema_code, `import oa "odinarrow"`) &&
+		strings.contains(schema_code, `import oa "skadi"`) &&
 		strings.contains(schema_code, "RECORD_COLUMN_COUNT :: 4") &&
 		strings.contains(schema_code, "Custom_Tick") &&
 		strings.contains(schema_code, "tick_ns_data: [^]i64") &&

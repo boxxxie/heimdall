@@ -9,7 +9,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 @(require) import "core:time"
-import oa "../deps/OdinArrow/src"
+import oa "../deps/skadi/skadi"
 import "../deps/sleipnir/actor"
 
 when ODIN_OS == .Linux {
@@ -83,8 +83,8 @@ Backpressure_Policy :: enum u8 {
 
 Backend_Mode :: enum u8 {
 	Auto             = 0, // Default: automatically detects the ideal backend (.Dedicated_Thread vs .Sleipnir_Actor)
-	Dedicated_Thread = 1, // Explicit override: dedicated background OS thread owns OdinArrow + disk I/O
-	Sleipnir_Actor   = 2, // Explicit override: runs the OdinArrow serializer as a Sleipnir Actor on an `actor.Scheduler`
+	Dedicated_Thread = 1, // Explicit override: dedicated background OS thread owns Skadi + disk I/O
+	Sleipnir_Actor   = 2, // Explicit override: runs the Skadi serializer as a Sleipnir Actor on an `actor.Scheduler`
 }
 
 Config :: struct {
@@ -1416,7 +1416,7 @@ acquire_free_page_locked :: proc(r: ^Recorder) -> bool {
 }
 
 // -----------------------------------------------------------------------------
-// Background OdinArrow Serializer (Shared by Dedicated Thread & Sleipnir Actor)
+// Background Skadi Serializer (Shared by Dedicated Thread & Sleipnir Actor)
 // -----------------------------------------------------------------------------
 
 @(private)
