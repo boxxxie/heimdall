@@ -1506,11 +1506,10 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 		}
 
 		// Open `MAX_TLS_RECORDERS + 1` (17) concurrent spans across distinct `(Recorder, actor_env)`
-		// slots on the same thread using a single initialized recorder and synthetic `actor.Context`
-		// envelopes (avoiding spawning 17 background threads inside the test), and verify slot 0
+		// slots on the same thread using a single initialized recorder and synthetic `actor_env`
+		// pointers (avoiding spawning 17 background threads inside the test), and verify slot 0
 		// (`many_guards[0]`) is never overwritten when slot acquisition saturates.
-		prev_user_ptr := context.user_ptr
-		fake_ctxs:   [heimdall.MAX_TLS_RECORDERS + 1]actor.Context
+		prev_env_override := heimdall.test_set_actor_env_override(nil)
 		fake_envs:   [heimdall.MAX_TLS_RECORDERS + 1]u64
 		many_guards: [heimdall.MAX_TLS_RECORDERS + 1]heimdall.Span_Guard
 		m_pfx := fmt.tprintf("%s_many_slots", s.file_prefix)
@@ -1521,21 +1520,20 @@ driver_verify_multi_recorder_same_thread_isolation :: proc(
 			policy           = .Drop,
 		}) == nil {
 			for m_idx in 0 ..< len(many_guards) {
-				fake_ctxs[m_idx] = actor.Context{current_env = &fake_envs[m_idx]}
-				context.user_ptr = &fake_ctxs[m_idx]
+				heimdall.test_set_actor_env_override(&fake_envs[m_idx])
 				many_guards[m_idx] = heimdall.span_begin(&rec_coop, "many_lib", "slot_span", i64(m_idx))
 			}
 			if many_guards[heimdall.MAX_TLS_RECORDERS].tls_slot_idx != -1 {
 				cross_recorder_leaks += 1
 			}
 			for m_idx := len(many_guards) - 1; m_idx >= 0; m_idx -= 1 {
-				context.user_ptr = &fake_ctxs[m_idx]
+				heimdall.test_set_actor_env_override(&fake_envs[m_idx])
 				if m_idx == 0 && heimdall.tls_active_span_id != many_guards[0].span_id {
 					cross_recorder_leaks += 1
 				}
 				heimdall.span_end(many_guards[m_idx])
 			}
-			context.user_ptr = prev_user_ptr
+			heimdall.test_set_actor_env_override(prev_env_override)
 			if heimdall.tls_active_span_id != 0 {
 				cross_recorder_leaks += 1
 			}
