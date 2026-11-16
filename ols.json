@@ -2,7 +2,7 @@
 	"$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
 	"collections": [
 		{ "name": "heimdall", "path": "./heimdall" },
-		{ "name": "odinarrow", "path": "./deps/OdinArrow/src" },
+		{ "name": "skadi", "path": "./deps/skadi/skadi" },
 		{ "name": "actor", "path": "./deps/sleipnir/actor" }
 	],
 	"enable_document_symbols": true,

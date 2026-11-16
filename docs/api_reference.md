@@ -47,8 +47,8 @@ Backpressure_Policy :: enum u8 {
 ```odin
 Backend_Mode :: enum u8 {
 	Auto             = 0, // Automatically selects .Dedicated_Thread or .Sleipnir_Actor
-	Dedicated_Thread = 1, // Dedicated background OS thread owns OdinArrow + disk I/O
-	Sleipnir_Actor   = 2, // Runs OdinArrow serializer as a Sleipnir Actor on an actor.Scheduler
+	Dedicated_Thread = 1, // Dedicated background OS thread owns Skadi + disk I/O
+	Sleipnir_Actor   = 2, // Runs Skadi serializer as a Sleipnir Actor on an actor.Scheduler
 }
 ```
 
@@ -118,7 +118,7 @@ Disables recording, pushes any non-empty active `#soa` page to the ready ring, w
 ```odin
 recorder_flush :: proc(r: ^Recorder)
 ```
-Rotates the current partial `#soa` page into the ready ring and blocks until all pages and buffered `OdinArrow` batches up to the current flush generation (`_flush_target_gen`) have been written to disk as an `.arrow` segment file. Safe to call while the recorder remains active or while the worker is paused.
+Rotates the current partial `#soa` page into the ready ring and blocks until all pages and buffered `Skadi` batches up to the current flush generation (`_flush_target_gen`) have been written to disk as an `.arrow` segment file. Safe to call while the recorder remains active or while the worker is paused.
 
 ### `set_default_recorder` / `default_recorder`
 ```odin
