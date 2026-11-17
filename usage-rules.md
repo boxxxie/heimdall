@@ -35,10 +35,12 @@ This file defines mandatory usage rules, idioms, and architectural constraints f
 * **DO** use manual `g := heimdall.span_begin(...)` and `defer heimdall.span_end(g)` only when you need to hold or mutate the `Span_Guard` value directly across conditional branches.
 
 ### 1.3 String Lifetimes (`string_fallback_copy`)
-* **By default (`Config.string_fallback_copy == false`):** Heimdall stores `scope` and `name` string slices by reference in the `#soa` staging page until the page is serialized to Arrow IPC.
-  * **DO** pass string literals or compile-time constants (`SCOPE_HTTP :: "net.http"`) when `string_fallback_copy == false`.
+* **By default (`Config.string_fallback_copy == false`):** Heimdall stores `scope` and `name` string slices by reference in the `#soa` staging page until the page is serialized to Arrow IPC (`0 B` producer allocations).
+  * **DO** pass string literals or compile-time constants (`SCOPE_HTTP :: "net.http"`) when `string_fallback_copy == false` — this is the fastest hot-path configuration.
   * **NEVER** pass `fmt.tprintf(...)` or heap-allocated strings that are freed before the segment flushes unless `Config.string_fallback_copy = true`.
-* **When passing dynamic strings:** Set `Config.string_fallback_copy = true`. Heimdall will clone `scope` and `name` into a single contiguous allocation under `Recorder._alloc_mu` and free them automatically after Arrow serialization (or upon drop).
+* **When passing dynamic strings (`Config.string_fallback_copy = true`):**
+  * **Point metrics & events (`event_emit`, `counter_add`, `gauge_set`, `histogram_record`):** Copy into a lazy-allocated per-`Staging_Page` `128 KB` bump slab (`PAGE_STRING_SLAB_CAP`) reserved under `r._mu` and reset in `O(1)` when the page is recycled, avoiding per-record heap allocations unless the slab fills or a single pair exceeds `128 KB`.
+  * **Spans (`scoped_span`, `span_begin`):** Must preserve `scope` and `name` across arbitrary span durations while pages rotate, so each active span still heap-clones via `Recorder._alloc_mu` / `Recorder.allocator` until `span_end` completes and the page flushes. Keep span names static whenever possible even if point metrics use dynamic strings, and avoid enabling `string_fallback_copy = true` globally unless dynamically freed strings are actually passed.
 
 ### 1.4 Library-Friendly `nil` Handling
 * **NEVER** wrap `heimdall.scoped_span`, `counter_add`, `gauge_set`, `histogram_record`, or `event_emit` in `if rec != nil && rec.enabled` checks at call sites. Every Heimdall instrumentation procedure already performs an inlined `r == nil || !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed)` fast-path check.
@@ -51,6 +53,7 @@ This file defines mandatory usage rules, idioms, and architectural constraints f
 * **ALWAYS** pair a successful `heimdall.recorder_init(&rec, cfg)` with `heimdall.recorder_destroy(&rec)` before `rec` goes out of scope or its backing memory is reused.
 * **DO** leave `Config.backend = .Auto` (the zero-value default) unless you have a specific reason to force `.Dedicated_Thread` or `.Sleipnir_Actor`.
 * **DO** use `Backpressure_Policy.Drop` for real-time threads (audio DSP, rendering, high-frequency tick loops) that must never block on disk I/O, and `Backpressure_Policy.Block` for lossless batch/server workloads.
+* **DO** bump `Config.ring_page_count` from `4` (default) to `8`–`16` for bursty `.Block` workloads so producers do not stall waiting on Arrow segment flushes (avoid `ring_page_count = 2` on high-throughput `.Block` pipelines).
 * **NEVER** mutate `rec.allocator` after `recorder_init` has been called while the background worker thread or flusher actor is running. Pass your custom `allocator` directly as the 3rd argument to `recorder_init(&rec, cfg, allocator)`.
 
 ---
