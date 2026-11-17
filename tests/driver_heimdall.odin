@@ -437,8 +437,23 @@ auto_detect_actor_receive :: proc(ctx: ^actor.Context, state: ^Auto_Detect_Actor
 			resolved = -3
 		}
 	}
-	heimdall.event_emit(&rec, "auto_actor", "ping", i64(msg^), .Ok)
+	if state.expect_shared {
+		// Emit a full page (`BATCH_CAP` events) so `rotate_active_page_locked` schedules
+		// `rec._flusher_actor` (`scheduled == 1` in `s.shards`) before `recorder_destroy` runs
+		// inside this actor turn (exercising 1-worker cooperative `actor.destroy` shard draining).
+		for i in 0 ..< heimdall.BATCH_CAP {
+			heimdall.event_emit(&rec, "auto_actor", "ping", i64(msg^) + i64(i), .Ok)
+		}
+	} else {
+		heimdall.event_emit(&rec, "auto_actor", "ping", i64(msg^), .Ok)
+	}
 	heimdall.recorder_destroy(&rec)
+	if state.expect_shared && resolved > 0 {
+		flushed, dropped := heimdall.recorder_diagnostics(&rec)
+		if flushed != 1 || dropped != 0 {
+			resolved = -4
+		}
+	}
 	actor.reply(ctx, resolved)
 }
 

@@ -18,15 +18,20 @@ To prevent false sharing between high-frequency producer threads and the backgro
 Each `Staging_Page` (`#align(64)`) holds `#soa[4096]Record` (`BATCH_CAP :: 4096`, `~344 KB` per page):
 ```odin
 Staging_Page :: struct #align(64) {
-	rows:      #soa[]Record,
-	count:     int,
-	_pad:      [64]u8,
-	committed: int,
+	rows:           #soa[]Record,
+	count:          int,
+	str_slab:       []u8,
+	str_alloc:      mem.Allocator,
+	str_used:       int,
+	heap_str_count: int,
+	_pad:           [64]u8,
+	committed:      int,
 }
 ```
-1. **Slot Reservation (Under `_mu`):** A producer thread increments `page.count` (`idx := page.count; page.count = idx + 1`). If `idx + 1 == BATCH_CAP`, the producer pushes the page index onto `_ready_ring` and pops the next free page from `_free_stack` (`rotate_active_page_locked`).
-2. **Columnar Store (Unlocked):** After releasing `_mu`, the producer writes the 11 fields directly into the contiguous `#soa` arrays (`stage_record_into_soa(page, idx, ...)`) and executes an `.Release` atomic increment on `page.committed`.
+1. **Slot Reservation (Under `_mu`):** A producer thread increments `page.count` (`idx := page.count; page.count = idx + 1`). When `string_fallback_copy` is enabled for non-span records, it also reserves `len(scope) + len(name)` bytes from the lazy-allocated `128 KB` `page.str_slab` under `_mu` (falling back to `clone_string_pair` and incrementing `page.heap_str_count` only if the slab fills). If `idx + 1 == BATCH_CAP`, the producer pushes the page index onto `_ready_ring` and pops the next free page from `_free_stack` (`rotate_active_page_locked`).
+2. **Columnar Store (Unlocked):** After releasing `_mu`, the producer copies dynamic strings into the reserved `str_slab` slice (if any), writes the 11 fields directly into the contiguous `#soa` arrays (`stage_record_into_soa(page, idx, ...)`), and executes an `.Release` atomic increment on `page.committed`.
 3. **Worker Drain & Zero-Copy Arrow Construction:** When the background worker or flusher actor pops a ready page, it spins briefly with `intrinsics.cpu_relax()` until `atomic_load_explicit(&page.committed, .Acquire) == page.count`. Because each field in `page.rows` is already a contiguous column array, `build_primitive_column_from_soa` copies each primitive column in a single `mem.copy_non_overlapping` into an `oa.Buffer_Pool`-backed Arrow buffer.
+4. **String Slab Reset (`O(1)`):** When `string_fallback_copy` is enabled, `free_page_strings` resets `page.str_used = 0` in `O(1)` before returning the page to `_free_stack`, scanning rows only when `page.heap_str_count > 0` (e.g., from `scoped_span` or slab overflow).
 
 ---
 

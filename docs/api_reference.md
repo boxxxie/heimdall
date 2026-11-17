@@ -11,9 +11,10 @@ This document provides the complete API reference for `package heimdall` and `pa
 BATCH_CAP            :: 4096 // Rows per #soa Staging_Page and Arrow Record_Batch
 DEFAULT_RING_PAGES   :: 4    // Default number of #soa pages in the producer/consumer ring
 DEFAULT_SEGMENT_SIZE :: 16   // Default batches per .arrow segment file (65,536 rows)
-MAX_TLS_RECORDERS    :: 16   // Max concurrent active (Recorder, Actor_Turn) span slots per OS thread
-SPAN_ID_BATCH_SIZE   :: 64   // Thread-local span ID reservation batch size
-RECORD_COLUMN_COUNT  :: 11   // Generated constant: column count of @(telemetry_schema) Record
+MAX_TLS_RECORDERS    :: 16        // Max concurrent active (Recorder, Actor_Turn) span slots per OS thread
+SPAN_ID_BATCH_SIZE   :: 64        // Thread-local span ID reservation batch size
+PAGE_STRING_SLAB_CAP :: 128 * 1024 // 128 KB per-page bump slab for `string_fallback_copy`
+RECORD_COLUMN_COUNT  :: 11        // Generated constant: column count of @(telemetry_schema) Record
 ```
 
 ### `Kind`
@@ -68,6 +69,9 @@ Config :: struct {
 	scheduler:            ^actor.Scheduler,    // Optional external Sleipnir Scheduler
 }
 ```
+
+* **`string_fallback_copy` performance note:** Leave `false` (default) and pass static literals/constants for `0 B` producer allocations. When `true`, point metrics/events (`event_emit`, `counter_add`, `gauge_set`, `histogram_record`) copy into a reusable per-`Staging_Page` `128 KB` bump slab (`PAGE_STRING_SLAB_CAP`, `O(1)` reset per page), falling back to heap cloning via `Recorder.allocator` only when a page's slab overflows or for `scoped_span` / `span_begin` calls (which must outlive page rotations until `span_end`).
+* **`ring_page_count` tuning note:** Default `4` pages (`~1.4 MB`) avoids `2`-page `.Block` backpressure stalls while keeping per-recorder memory modest; raise to `8`–`16` for sustained bursty `.Block` ingestion.
 
 ### `Record`
 Annotated with `@(telemetry_schema)` to drive `heimdall/schema_gen.odin`:

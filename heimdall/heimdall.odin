@@ -60,8 +60,9 @@ when ODIN_OS == .Linux {
 BATCH_CAP            :: 4096
 DEFAULT_RING_PAGES   :: 4  // 2+ pages allow lock-free I/O overlap
 DEFAULT_SEGMENT_SIZE :: 16 // 16 batches * 4096 rows = 65,536 rows per .arrow file
-MAX_TLS_RECORDERS    :: 16 // Concurrent active (Recorder, Actor_Turn) span slots per OS thread
-SPAN_ID_BATCH_SIZE   :: 64 // Thread-local span ID reservation batch size
+MAX_TLS_RECORDERS    :: 16        // Concurrent active (Recorder, Actor_Turn) span slots per OS thread
+SPAN_ID_BATCH_SIZE   :: 64        // Thread-local span ID reservation batch size
+PAGE_STRING_SLAB_CAP :: 128 * 1024 // 128 KB per-page bump slab for `string_fallback_copy`
 
 Kind :: enum u8 {
 	Span      = 0,
@@ -117,10 +118,14 @@ Record :: struct {
 
 @(private)
 Staging_Page :: struct #align(64) {
-	rows:      #soa[]Record,
-	count:     int,
-	_pad:      [64]u8,
-	committed: int,
+	rows:           #soa[]Record,
+	count:          int,
+	str_slab:       []u8,
+	str_alloc:      mem.Allocator,
+	str_used:       int,
+	heap_str_count: int,
+	_pad:           [64]u8,
+	committed:      int,
 }
 
 @(private)
@@ -621,6 +626,14 @@ recorder_destroy :: proc(r: ^Recorder) {
 		}
 		if r.cfg.string_fallback_copy {
 			free_page_strings(r, &r._pages[i])
+		}
+		if r._pages[i].str_slab != nil {
+			slab_alloc := r._pages[i].str_alloc if r._pages[i].str_alloc.procedure != nil else alloc
+			sync.mutex_lock(&r._alloc_mu)
+			_ = mem.free_with_size(raw_data(r._pages[i].str_slab), len(r._pages[i].str_slab), slab_alloc)
+			sync.mutex_unlock(&r._alloc_mu)
+			r._pages[i].str_slab  = nil
+			r._pages[i].str_alloc = {}
 		}
 		delete_soa(r._pages[i].rows, page_alloc)
 	}
@@ -1232,18 +1245,6 @@ record_raw :: #force_inline proc(
 		return
 	}
 
-	if r.cfg.string_fallback_copy && !already_cloned {
-		var_s, var_n, var_alloc, clone_ok := clone_string_pair(r, scope, name)
-		if !clone_ok {
-			_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
-			return
-		}
-		stored_scope = var_s
-		stored_name  = var_n
-		used_alloc   = var_alloc
-		owns_strings = true
-	}
-
 	sync.mutex_lock(&r._mu)
 
 	if !intrinsics.atomic_load_explicit(&r.enabled, .Relaxed) ||
@@ -1268,6 +1269,50 @@ record_raw :: #force_inline proc(
 	}
 
 	page := &r._pages[r._active_page_idx]
+	slab_dest: []u8
+	if r.cfg.string_fallback_copy {
+		if already_cloned {
+			if len(stored_scope) + len(stored_name) > 0 {
+				page.heap_str_count += 1
+			}
+		} else {
+			s_len := len(scope)
+			n_len := len(name)
+			total := s_len + n_len
+			if total > 0 {
+				if page.str_slab == nil && total <= PAGE_STRING_SLAB_CAP {
+					sync.mutex_lock(&r._alloc_mu)
+					slab_alloc := r.allocator
+					slab_mem, slab_err := mem.alloc_bytes_non_zeroed(PAGE_STRING_SLAB_CAP, 1, slab_alloc)
+					sync.mutex_unlock(&r._alloc_mu)
+					if slab_err == nil && slab_mem != nil {
+						page.str_slab  = slab_mem
+						page.str_alloc = slab_alloc
+						page.str_used  = 0
+					}
+				}
+				if page.str_slab != nil && page.str_used + total <= len(page.str_slab) {
+					off := page.str_used
+					page.str_used = off + total
+					slab_dest = page.str_slab[off : off + total]
+				} else {
+					var_s, var_n, _, clone_ok := clone_string_pair(r, scope, name)
+					if !clone_ok {
+						sync.mutex_unlock(&r._mu)
+						_ = intrinsics.atomic_add_explicit(&r._dropped_records, 1, .Relaxed)
+						return
+					}
+					stored_scope = var_s
+					stored_name  = var_n
+					page.heap_str_count += 1
+				}
+			} else {
+				stored_scope = ""
+				stored_name  = ""
+			}
+		}
+	}
+
 	idx  := page.count
 	page.count = idx + 1
 	notify_sched: ^actor.Scheduler
@@ -1276,6 +1321,24 @@ record_raw :: #force_inline proc(
 		notify_sched, notify_actor = rotate_active_page_locked(r)
 	}
 	sync.mutex_unlock(&r._mu)
+
+	if slab_dest != nil {
+		dest_ptr := raw_data(slab_dest)
+		s_len    := len(scope)
+		n_len    := len(name)
+		if s_len > 0 {
+			mem.copy_non_overlapping(dest_ptr, raw_data(scope), s_len)
+			stored_scope = string(slab_dest[:s_len])
+		} else {
+			stored_scope = ""
+		}
+		if n_len > 0 {
+			mem.copy_non_overlapping(rawptr(uintptr(dest_ptr) + uintptr(s_len)), raw_data(name), n_len)
+			stored_name = string(slab_dest[s_len : s_len + n_len])
+		} else {
+			stored_name = ""
+		}
+	}
 
 	stage_record_into_soa(
 		page,
@@ -1301,10 +1364,18 @@ record_raw :: #force_inline proc(
 
 @(private)
 free_page_strings :: proc(r: ^Recorder, page: ^Staging_Page) {
+	page.str_used = 0
+	if page.heap_str_count <= 0 {
+		return
+	}
+	page.heap_str_count = 0
 	n := page.count
 	if n <= 0 {
 		return
 	}
+	has_slab   := len(page.str_slab) > 0
+	slab_start := uintptr(raw_data(page.str_slab)) if has_slab else 0
+	slab_end   := slab_start + uintptr(len(page.str_slab)) if has_slab else 0
 	CHUNK :: 128
 	for base := 0; base < n; base += CHUNK {
 		end := min(base + CHUNK, n)
@@ -1315,7 +1386,10 @@ free_page_strings :: proc(r: ^Recorder, page: ^Staging_Page) {
 			total := len(sc) + len(nm)
 			if total > 0 {
 				ptr := raw_data(sc) if len(sc) > 0 else raw_data(nm)
-				_ = mem.free_with_size(ptr, total, r.allocator)
+				in_slab := has_slab && uintptr(ptr) >= slab_start && uintptr(ptr) < slab_end
+				if !in_slab {
+					_ = mem.free_with_size(ptr, total, r.allocator)
+				}
 				page.rows.scope[i] = ""
 				page.rows.name[i]  = ""
 			}

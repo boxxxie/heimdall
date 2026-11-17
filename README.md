@@ -63,8 +63,8 @@ main :: proc() {
 	err := heimdall.recorder_init(&rec, heimdall.Config{
 		file_prefix          = "logs/service_telemetry", // Writes logs/service_telemetry_000000.arrow, ...
 		batches_per_file     = 16,                       // 16 * 4,096 = 65,536 rows per .arrow file
-		ring_page_count      = 4,                        // 4 #soa pages in the producer/consumer ring
-		string_fallback_copy = false,                    // Set true if passing dynamically freed strings
+		ring_page_count      = 4,                        // 4 #soa pages in ring (use 8-16 for bursty .Block workloads)
+		string_fallback_copy = false,                    // Keep false for 0 B alloc hot paths; set true only for dynamic strings
 		policy               = .Block,                   // .Block (lossless) or .Drop (real-time non-blocking)
 		backend              = .Auto,                    // .Auto, .Dedicated_Thread, or .Sleipnir_Actor
 	})
@@ -96,6 +96,10 @@ main :: proc() {
 | Inside a 1-worker Sleipnir actor turn + `.Drop` policy | `.Sleipnir_Actor` (shared `ctx.sched`) | Non-blocking producer safely multiplexes with the flusher actor on 1 worker. |
 | Explicit `backend = .Dedicated_Thread` | `.Dedicated_Thread` | Always spawns a dedicated background OS thread (even if `scheduler != nil`). |
 | Explicit `backend = .Sleipnir_Actor` (`scheduler == nil` on OS thread) | `.Sleipnir_Actor` (`_owned_sched = true`) | Spawns an internal 1-worker `actor.Scheduler` owned by the `Recorder`. |
+
+### Performance & Configuration Tuning
+* **Prefer `string_fallback_copy = false` (default) on hot paths:** Pass string literals or compile-time constants to achieve `0 B` producer allocations. When `string_fallback_copy = true` is required for dynamically freed strings, point metrics and events (`event_emit`, `counter_add`, `gauge_set`, `histogram_record`) copy into a reusable per-page `128 KB` bump slab (`O(1)` reset per batch, falling back to `Recorder.allocator` if a batch overflows the slab), whereas `scoped_span` / `span_begin` must heap-clone strings across the open lifetime of the span.
+* **Increase `ring_page_count` for bursty `.Block` pipelines:** The default `4` pages (`~1.4 MB`) balances memory against I/O overlap; setting `8`–`16` pages prevents producers from stalling behind Arrow disk serialization during heavy bursts (`2` pages roughly halves `.Block` saturation throughput).
 
 ---
 
