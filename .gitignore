@@ -6,3 +6,5 @@
 *.a
 *.so
 *.arrow
+*.hpk
+*.bpk

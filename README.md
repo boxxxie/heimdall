@@ -128,7 +128,7 @@ Heimdall persists `.arrow` IPC files with 11 canonical OpenTelemetry-compatible 
 * `heimdall/` — Core telemetry recorder (`heimdall.odin`), generated Arrow schema serializer/reader (`schema_gen.odin`), and AST codegen/linter library (`heimdall/codegen/`).
 * `tools/heimdall_gen/` — CLI AST code generator for `@(telemetry_schema)` structs and the 4-layer ATDD test suite.
 * `tests/` — 4-layer ATDD specification suite (`spec_*.odin`, `dsl_heimdall.odin`, `dsl_atdd_gen.odin`, `driver_heimdall.odin`).
-* `benchmarks/` — Throughput, latency, multi-threaded scaling, and Arrow I/O roundtrip benchmark suite (`bench_heimdall.odin`).
+* `benchmarks/` — `hugi`-backed throughput, latency, multi-threaded scaling, and Arrow I/O roundtrip benchmark suite (`bench_heimdall.odin`, [benchmarks/README.md](benchmarks/README.md)).
 * [`usage-rules.md`](./usage-rules.md) — Strict usage rules, idioms, and anti-patterns for AI coding agents and contributors.
 * [`docs/api_reference.md`](./docs/api_reference.md) — Complete API reference for `package heimdall` and `package heimdall_codegen`.
 * [`docs/architecture_and_atdd.md`](./docs/architecture_and_atdd.md) — Deep dive into the `#soa` ring architecture, concurrency model, and 4-layer ATDD AST verifier.
@@ -151,10 +151,11 @@ odin test tests -custom-attribute:telemetry_schema
 ```bash
 odin check heimdall/codegen -no-entry-point -vet -strict-style -vet-tabs -disallow-do
 odin check tests -no-entry-point -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall,heimdall_codegen,heimdall_tests
-odin check benchmarks -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
+odin check benchmarks -collection:heimdall=./heimdall -collection:skadi=./deps/skadi/skadi -collection:actor=./deps/sleipnir/actor -collection:hugi=../hugi/hugi -vet -strict-style -vet-tabs -disallow-do -custom-attribute:telemetry_schema -vet-packages:heimdall,heimdall_benchmarks
 ```
 
 ### Run the Benchmark Suite
 ```bash
-odin run benchmarks -o:speed -no-bounds-check -custom-attribute:telemetry_schema
+hugi run benchmarks --runs 5
 ```
+See [benchmarks/README.md](benchmarks/README.md) for group filters, `hugi compare --last`, and updating the benchmark summary table (`hugi export --update-readme benchmarks/README.md`).
