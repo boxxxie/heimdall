@@ -15,6 +15,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Checkout hugi v0.1.4 (runner only)
+        uses: actions/checkout@v4
+        with:
+          repository: boxxxie/hugi
+          ref: v0.1.4
+          path: .tmp/hugi
+          persist-credentials: false
+
+      - name: Init hugi obench submodule
+        run: git -C .tmp/hugi submodule update --init deps/obench
+
       - name: Setup Odin compiler
         uses: laytan/setup-odin@v2
         with:
@@ -42,4 +53,4 @@ jobs:
 
       - name: Type-check benchmark suite
         run: |
-          odin check benchmarks -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
+          odin check benchmarks -collection:hugi=.tmp/hugi/hugi -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
