@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 400" width="880" height="400" role="img" aria-label="Multi-Threaded Producer Scaling (1–8 OS Threads)">
+<style>
+  .bg { fill: #0d1117; }
+  .panel { fill: #161b22; stroke: #30363d; stroke-width: 1; }
+  .grid { stroke: #21262d; stroke-width: 1; }
+  .axis { stroke: #30363d; stroke-width: 1.2; }
+  .title { fill: #f0f6fc; font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .sub { fill: #8b949e; font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .tick { fill: #8b949e; font: 500 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .legend { fill: #c9d1d9; font: 500 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .val { font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+<rect class="bg" width="880" height="400" rx="10"/>
+<rect class="panel" x="82" y="74" width="702" height="244" rx="4"/>
+<text class="title" x="82" y="30">Multi-Threaded Producer Scaling (1–8 OS Threads)</text>
+<text class="sub" x="82" y="49">Commit f362297bcbdb · -o:speed -microarch:native · Linear latency per event (p50)</text>
+<line class="grid" x1="82" y1="318.0" x2="784" y2="318.0"/>
+<text class="tick" x="74" y="322.0" text-anchor="end">0</text>
+<line class="grid" x1="82" y1="269.2" x2="784" y2="269.2"/>
+<text class="tick" x="74" y="273.2" text-anchor="end">50 ns</text>
+<line class="grid" x1="82" y1="220.4" x2="784" y2="220.4"/>
+<text class="tick" x="74" y="224.4" text-anchor="end">100 ns</text>
+<line class="grid" x1="82" y1="171.6" x2="784" y2="171.6"/>
+<text class="tick" x="74" y="175.6" text-anchor="end">150 ns</text>
+<line class="grid" x1="82" y1="122.8" x2="784" y2="122.8"/>
+<text class="tick" x="74" y="126.8" text-anchor="end">200 ns</text>
+<line class="grid" x1="82" y1="74.0" x2="784" y2="74.0"/>
+<text class="tick" x="74" y="78.0" text-anchor="end">250 ns</text>
+<line class="grid" x1="82.0" y1="74" x2="82.0" y2="318"/>
+<text class="tick" x="82.0" y="336" text-anchor="middle">1 thread</text>
+<line class="grid" x1="316.0" y1="74" x2="316.0" y2="318"/>
+<text class="tick" x="316.0" y="336" text-anchor="middle">2 threads</text>
+<line class="grid" x1="550.0" y1="74" x2="550.0" y2="318"/>
+<text class="tick" x="550.0" y="336" text-anchor="middle">4 threads</text>
+<line class="grid" x1="784.0" y1="74" x2="784.0" y2="318"/>
+<text class="tick" x="784.0" y="336" text-anchor="middle">8 threads</text>
+<line class="axis" x1="82" y1="318" x2="784" y2="318"/>
+<line class="axis" x1="82" y1="74" x2="82" y2="318"/>
+<path d="M 82.0 261.5 L 316.0 225.7 L 550.0 192.8 L 784.0 141.2" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="82.0" cy="261.5" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="1.5"/>
+<circle cx="316.0" cy="225.7" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="1.5"/>
+<circle cx="550.0" cy="192.8" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="1.5"/>
+<circle cx="784.0" cy="141.2" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="1.5"/>
+<text class="val" x="792" y="145.2" text-anchor="start" fill="#58a6ff">181.13 ns</text>
+<rect x="82.0" y="353.0" width="12" height="4" rx="2" fill="#58a6ff"/>
+<text class="legend" x="100.0" y="359.0">mt_scaling (Skadi background worker)</text>
+</svg>

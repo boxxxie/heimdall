@@ -4,7 +4,8 @@
 		{ "name": "heimdall", "path": "./heimdall" },
 		{ "name": "skadi", "path": "./deps/skadi/skadi" },
 		{ "name": "actor", "path": "./deps/sleipnir/actor" },
-		{ "name": "hugi", "path": "../hugi/hugi" }
+		{ "name": "hugi", "path": "../hugi/hugi" },
+		{ "name": "temple", "path": "../temple" }
 	],
 	"enable_document_symbols": true,
 	"enable_hover": true,

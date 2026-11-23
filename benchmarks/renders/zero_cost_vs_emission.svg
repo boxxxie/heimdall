@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 530" width="940" height="530" role="img" aria-label="Zero-Cost Disabled Path vs Active Emission &amp; Arrow IPC">
+<style>
+  .bg { fill: #0d1117; }
+  .panel { fill: #161b22; stroke: #30363d; stroke-width: 1; }
+  .grid { stroke: #21262d; stroke-width: 1; }
+  .title { fill: #f0f6fc; font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .sub { fill: #8b949e; font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .lbl { fill: #c9d1d9; font: 500 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tick { fill: #8b949e; font: 500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .val { fill: #e6edf3; font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+<rect class="bg" width="940" height="530" rx="10"/>
+<rect class="panel" x="250" y="68" width="460" height="420" rx="4"/>
+<text class="title" x="24" y="30">Zero-Cost Disabled Path vs Active Emission &amp; Arrow IPC</text>
+<text class="sub" x="24" y="49">Commit f362297bcbdb · -o:speed -microarch:native</text>
+<line class="grid" x1="250.0" y1="68" x2="250.0" y2="488"/>
+<text class="tick" x="250.0" y="506" text-anchor="middle">100 ps</text>
+<line class="grid" x1="403.3" y1="68" x2="403.3" y2="488"/>
+<text class="tick" x="403.3" y="506" text-anchor="middle">1 ns</text>
+<line class="grid" x1="556.7" y1="68" x2="556.7" y2="488"/>
+<text class="tick" x="556.7" y="506" text-anchor="middle">10 ns</text>
+<line class="grid" x1="710.0" y1="68" x2="710.0" y2="488"/>
+<text class="tick" x="710.0" y="506" text-anchor="middle">100 ns</text>
+<text class="lbl" x="240" y="94.0" text-anchor="end">counter_add (nil)</text>
+<rect x="250" y="81.0" width="130.2" height="20" rx="4" fill="#3fb950"/>
+<text class="val" x="388.2" y="95.0">706.13 ps (116.06 GB/s)</text>
+<text class="lbl" x="240" y="128.0" text-anchor="end">scoped_span (nil)</text>
+<rect x="250" y="115.0" width="131.3" height="20" rx="4" fill="#3fb950"/>
+<text class="val" x="389.3" y="129.0">718.28 ps (114.10 GB/s)</text>
+<text class="lbl" x="240" y="162.0" text-anchor="end">scoped_span (disabled)</text>
+<rect x="250" y="149.0" width="137.6" height="20" rx="4" fill="#3fb950"/>
+<text class="val" x="395.6" y="163.0">790.11 ps (103.73 GB/s)</text>
+<text class="lbl" x="240" y="196.0" text-anchor="end">nested_http_db (nil)</text>
+<rect x="250" y="183.0" width="250.7" height="20" rx="4" fill="#79c0ff"/>
+<text class="val" x="508.7" y="197.0">4.32 ns (75.96 GB/s)</text>
+<text class="lbl" x="240" y="230.0" text-anchor="end">arrow_read_262k (Skadi)</text>
+<rect x="250" y="217.0" width="247.6" height="20" rx="4" fill="#58a6ff"/>
+<text class="val" x="505.6" y="231.0">4.12 ns (19.46 GB/s)</text>
+<text class="lbl" x="240" y="264.0" text-anchor="end">drop_500k_burst (.Drop)</text>
+<rect x="250" y="251.0" width="382.9" height="20" rx="4" fill="#d2a8ff"/>
+<text class="val" x="640.9" y="265.0">31.44 ns (2.61 GB/s)</text>
+<text class="lbl" x="240" y="298.0" text-anchor="end">block_500k_burst (.Block)</text>
+<rect x="250" y="285.0" width="408.5" height="20" rx="4" fill="#ffa657"/>
+<text class="val" x="666.5" y="299.0">46.13 ns (1.78 GB/s)</text>
+<text class="lbl" x="240" y="332.0" text-anchor="end">counter_add (.Block)</text>
+<rect x="250" y="319.0" width="415.3" height="20" rx="4" fill="#58a6ff"/>
+<text class="val" x="673.3" y="333.0">51.13 ns (1.60 GB/s)</text>
+<text class="lbl" x="240" y="366.0" text-anchor="end">event_emit (.Block)</text>
+<rect x="250" y="353.0" width="416.4" height="20" rx="4" fill="#58a6ff"/>
+<text class="val" x="674.4" y="367.0">51.99 ns (1.58 GB/s)</text>
+<text class="lbl" x="240" y="400.0" text-anchor="end">arrow_write_262k</text>
+<rect x="250" y="387.0" width="427.9" height="20" rx="4" fill="#d2a8ff"/>
+<text class="val" x="685.9" y="401.0">61.74 ns (1.33 GB/s)</text>
+<text class="lbl" x="240" y="434.0" text-anchor="end">scoped_span_raii</text>
+<rect x="250" y="421.0" width="437.0" height="20" rx="4" fill="#f78166"/>
+<text class="val" x="695.0" y="435.0">70.83 ns (1.16 GB/s)</text>
+<text class="lbl" x="240" y="468.0" text-anchor="end">event_emit_dynamic_copy</text>
+<rect x="250" y="455.0" width="439.7" height="20" rx="4" fill="#f78166"/>
+<text class="val" x="697.7" y="469.0">73.69 ns (1.11 GB/s)</text>
+</svg>

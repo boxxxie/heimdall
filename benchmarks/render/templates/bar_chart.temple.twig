@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {{ this.width | int }} {{ this.height | int }}" width="{{ this.width | int }}" height="{{ this.height | int }}" role="img" aria-label="{{ this.title }}">
+<style>
+  .bg { fill: #0d1117; }
+  .panel { fill: #161b22; stroke: #30363d; stroke-width: 1; }
+  .grid { stroke: #21262d; stroke-width: 1; }
+  .title { fill: #f0f6fc; font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .sub { fill: #8b949e; font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .lbl { fill: #c9d1d9; font: 500 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tick { fill: #8b949e; font: 500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .val { fill: #e6edf3; font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+<rect class="bg" width="{{ this.width | int }}" height="{{ this.height | int }}" rx="10"/>
+<rect class="panel" x="{{ this.pad_l | int }}" y="{{ this.pad_t | int }}" width="{{ this.pw | int }}" height="{{ this.ph | int }}" rx="4"/>
+<text class="title" x="24" y="30">{{ this.title }}</text>
+<text class="sub" x="24" y="49">{{ this.subtitle }}</text>
+{%- for xt in this.x_ticks %}
+<line class="grid" x1="{{ xt.pos }}" y1="{{ this.pad_t | int }}" x2="{{ xt.pos }}" y2="{{ this.plot_bottom | int }}"/>
+<text class="tick" x="{{ xt.pos }}" y="{{ this.x_label_y | int }}" text-anchor="middle">{{ xt.label }}</text>
+{%- end %}
+{%- for bar in this.bars %}
+<text class="lbl" x="{{ this.label_x | int }}" y="{{ bar.text_y }}" text-anchor="end">{{ bar.label }}</text>
+<rect x="{{ this.pad_l | int }}" y="{{ bar.rect_y }}" width="{{ bar.width }}" height="20" rx="4" fill="{{ bar.color }}"/>
+<text class="val" x="{{ bar.val_x }}" y="{{ bar.val_y }}">{{ bar.val_text }}</text>
+{%- end %}
+</svg>

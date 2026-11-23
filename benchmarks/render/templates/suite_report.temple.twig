@@ -1,0 +1,61 @@
+[Root README](../README.md) · **Suite Renders**
+
+# Heimdall Benchmarks & Visual Renders
+
+Pure-Odin throughput, latency, scaling, and Arrow IPC I/O benchmark suite for **Heimdall** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`temple`](https://github.com/boxxxie/temple) under [`renders/`](renders/).
+
+---
+
+## Visual Renders (`-o:speed`)
+
+### 1. Zero-Cost Disabled Path vs Active Emission & Arrow IPC
+
+![Zero-Cost vs Active Emission and Arrow IPC](renders/zero_cost_vs_emission.svg)
+
+### 2. Multi-Threaded OS Producer Scaling (`1`–`8` Threads)
+
+![Multi-Threaded Producer Scaling](renders/mt_producer_scaling.svg)
+
+### 3. Backend Routing (`.Auto` vs Forced) & Sleipnir Actor Comparison
+
+![Backend Routing and Sleipnir Actor Comparison](renders/backend_and_auto_routing.svg)
+
+---
+
+## Reproducing & Regenerating Renders
+
+```bash
+# 1. Run the suite and append results to benchmarks/history.hugidb
+hugi run benchmarks --runs 5
+
+# 2. Run a subset of groups without modifying history.hugidb
+hugi run benchmarks --no-db --runs 1 --groups zero_cost,single_thread
+
+# 3. Statistically compare the last two commits (Mann-Whitney U / Welch t-test)
+hugi compare --last
+
+# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using temple AOT templates
+odin run benchmarks/render -collection:temple=../temple
+```
+
+---
+
+## Full Benchmark Results (`{{ this.total_benchmarks | int }}` Benchmarks at `{{ this.commit | raw }}`)
+
+<!-- BEGIN_BENCHMARK_TABLE -->
+{%- for group in this.groups %}
+### {{ group.title | raw }} (`{{ group.count | int }}` benchmarks)
+
+{%- if group.has_desc %}
+
+{{ group.desc | raw }}
+{%- end %}
+
+| Benchmark | Median (`p50`) | `P95` | Throughput / Ops | `CV%` | Allocs / op |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+{%- for row in group.rows %}
+| `{{ row.name | raw }}` | **{{ row.median | raw }}** | {{ row.p95 | raw }} | {{ row.ops | raw }} | {{ row.cv | raw }} | {{ row.allocs | raw }} |
+{%- end %}
+
+{%- end %}
+<!-- END_BENCHMARK_TABLE -->
