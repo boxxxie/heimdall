@@ -15,12 +15,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Checkout temple
+      - name: Checkout runa
         uses: actions/checkout@v7
         with:
-          repository: boxxxie/temple
+          repository: boxxxie/runa
           ref: main
-          path: .tmp/temple
+          path: .tmp/runa
           submodules: false
           persist-credentials: false
 
@@ -64,6 +64,6 @@ jobs:
       - name: Type-check benchmark suite
         run: |
           odin check benchmarks -collection:hugi=.tmp/hugi/hugi -collection:obench=.tmp/hugi/deps/obench/obench -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
-          odin run .tmp/temple/cli -- --check --warn-unused benchmarks/render -out:benchmarks/render/templates_gen.odin -pkg:bench_render -temple-import:temple:.
-          odin check benchmarks/render -collection:temple=.tmp/temple -vet -strict-style -vet-tabs -vet-packages:bench_render
-          odin test benchmarks/render -collection:temple=.tmp/temple -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+          odin run .tmp/runa/cli -- --check --warn-unused benchmarks/render -out:benchmarks/render/templates_gen.odin -pkg:bench_render -runa-import:runa:.
+          odin check benchmarks/render -collection:runa=.tmp/runa -vet -strict-style -vet-tabs -vet-packages:bench_render
+          odin test benchmarks/render -collection:runa=.tmp/runa -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true

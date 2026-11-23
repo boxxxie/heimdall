@@ -158,4 +158,4 @@ odin check benchmarks -collection:heimdall=./heimdall -collection:skadi=./deps/s
 ```bash
 hugi run benchmarks --runs 5
 ```
-See [benchmarks/README.md](benchmarks/README.md) for group filters, `hugi compare --last`, and regenerating the `temple`-rendered SVG charts and benchmark tables (`odin run benchmarks/render -collection:temple=../temple`).
+See [benchmarks/README.md](benchmarks/README.md) for group filters, `hugi compare --last`, and regenerating the `runa`-rendered SVG charts and benchmark tables (`odin run benchmarks/render -collection:runa=../runa`).
