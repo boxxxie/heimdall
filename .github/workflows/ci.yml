@@ -15,14 +15,26 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Checkout temple v1.0.0
+      - name: Checkout temple
         uses: actions/checkout@v7
         with:
           repository: boxxxie/temple
-          ref: v1.0.0
+          ref: main
           path: .tmp/temple
           submodules: false
           persist-credentials: false
+
+      - name: Checkout hugi v0.2.0 (runner only)
+        uses: actions/checkout@v7
+        with:
+          repository: boxxxie/hugi
+          ref: v0.2.0
+          path: .tmp/hugi
+          submodules: false
+          persist-credentials: false
+
+      - name: Init hugi obench submodule
+        run: git -C .tmp/hugi submodule update --init deps/obench
 
       - name: Setup Odin compiler
         uses: laytan/setup-odin@v2
@@ -51,6 +63,7 @@ jobs:
 
       - name: Type-check benchmark suite
         run: |
-          odin check benchmarks -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
+          odin check benchmarks -collection:hugi=.tmp/hugi/hugi -collection:obench=.tmp/hugi/deps/obench/obench -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_benchmarks,heimdall
+          odin run .tmp/temple/cli -- --check --warn-unused benchmarks/render -out:benchmarks/render/templates_gen.odin -pkg:bench_render -temple-import:temple:.
           odin check benchmarks/render -collection:temple=.tmp/temple -vet -strict-style -vet-tabs -vet-packages:bench_render
           odin test benchmarks/render -collection:temple=.tmp/temple -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
