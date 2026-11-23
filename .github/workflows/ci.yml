@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: boxxxie/runa
-          ref: main
+          ref: master
           path: .tmp/runa
           submodules: false
           persist-credentials: false
