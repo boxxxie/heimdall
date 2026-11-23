@@ -5,7 +5,7 @@
 		{ "name": "skadi", "path": "./deps/skadi/skadi" },
 		{ "name": "actor", "path": "./deps/sleipnir/actor" },
 		{ "name": "hugi", "path": "../hugi/hugi" },
-		{ "name": "temple", "path": "../temple" }
+		{ "name": "runa", "path": "../runa" }
 	],
 	"enable_document_symbols": true,
 	"enable_hover": true,

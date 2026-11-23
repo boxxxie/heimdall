@@ -2,7 +2,7 @@
 
 # Heimdall Benchmarks & Visual Renders
 
-Pure-Odin throughput, latency, scaling, and Arrow IPC I/O benchmark suite for **Heimdall** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`temple`](https://github.com/boxxxie/temple) under [`renders/`](renders/).
+Pure-Odin throughput, latency, scaling, and Arrow IPC I/O benchmark suite for **Heimdall** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`runa`](https://github.com/boxxxie/runa) under [`renders/`](renders/).
 
 ---
 
@@ -34,8 +34,8 @@ hugi run benchmarks --no-db --runs 1 --groups zero_cost,single_thread
 # 3. Statistically compare the last two commits (Mann-Whitney U / Welch t-test)
 hugi compare --last
 
-# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using temple AOT templates
-odin run benchmarks/render -collection:temple=../temple
+# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using runa AOT templates
+odin run benchmarks/render -collection:runa=../runa
 ```
 
 ---
