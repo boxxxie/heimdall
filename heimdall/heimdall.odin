@@ -9,8 +9,8 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 @(require) import "core:time"
-import oa "../deps/skadi/skadi"
-import "../deps/sleipnir/actor"
+import oa "skadi:."
+import actor "actor:."
 
 when ODIN_OS == .Linux {
 	foreign import libc "system:c"

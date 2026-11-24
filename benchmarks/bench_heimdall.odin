@@ -13,7 +13,7 @@
 //
 // Run via:
 //   hugi run benchmarks --runs 5
-//   odin check benchmarks -collection:heimdall=./heimdall -collection:skadi=./deps/skadi/skadi -collection:actor=./deps/sleipnir/actor -collection:hugi=../hugi/hugi -vet -strict-style -vet-tabs -disallow-do -custom-attribute:telemetry_schema -vet-packages:heimdall,heimdall_benchmarks
+//   odin check benchmarks -collection:heimdall=./heimdall -collection:skadi=../skadi/skadi -collection:actor=../sleipnir/actor -collection:hugi=../hugi/hugi -vet -strict-style -vet-tabs -disallow-do -custom-attribute:telemetry_schema -vet-packages:heimdall,heimdall_benchmarks
 // =============================================================================
 
 package heimdall_benchmarks
@@ -25,8 +25,8 @@ import "core:sync"
 import "core:thread"
 import hugi "hugi:."
 import "../heimdall"
-import oa "../deps/skadi/skadi"
-import actor "../deps/sleipnir/actor"
+import oa "skadi:."
+import actor "actor:."
 
 @(private = "file")
 g_bench_seq: u64

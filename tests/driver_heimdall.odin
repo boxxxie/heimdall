@@ -13,8 +13,8 @@ import "core:thread"
 import "core:time"
 import "../heimdall"
 import codegen "../heimdall/codegen"
-import oa "../deps/skadi/skadi"
-import actor "../deps/sleipnir/actor"
+import oa "skadi:."
+import actor "actor:."
 
 // =============================================================================
 // Layer 3: Protocol Driver (`tests/driver_heimdall.odin`)

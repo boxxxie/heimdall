@@ -30,7 +30,7 @@ package heimdall_tests
 import "core:testing"
 import "core:os"
 import "../heimdall"
-import oa "../deps/skadi/skadi"
+import oa "skadi:."
 
 forbidden_file_const :: 42
 
@@ -64,7 +64,7 @@ then_opaque_mega_step :: proc(s: ^Suite_Ctx) {
 		expected_testing_calls  = 1,
 		expected_zero_arg_steps = 2, // 1 in dsl decl + 1 at spec call site
 		expected_driver_leaks   = 4, // s.rec_active in helper + drv.rec (x2) + current_scenario().rec_active
-		expected_forbidden_imps = 3, // "core:os" + "../heimdall" + "../deps/skadi/skadi"
+		expected_forbidden_imps = 3, // "core:os" + "../heimdall" + "skadi:."
 		expected_do_statements  = 1,
 	)
 

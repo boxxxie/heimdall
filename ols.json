@@ -2,8 +2,8 @@
 	"$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
 	"collections": [
 		{ "name": "heimdall", "path": "./heimdall" },
-		{ "name": "skadi", "path": "./deps/skadi/skadi" },
-		{ "name": "actor", "path": "./deps/sleipnir/actor" },
+		{ "name": "skadi", "path": "../skadi/skadi" },
+		{ "name": "actor", "path": "../sleipnir/actor" },
 		{ "name": "hugi", "path": "../hugi/hugi" },
 		{ "name": "runa", "path": "../runa" }
 	],

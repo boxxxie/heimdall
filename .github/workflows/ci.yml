@@ -50,16 +50,16 @@ jobs:
 
       - name: Type-check Heimdall library & codegen packages
         run: |
-          odin check heimdall -no-entry-point -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall
+          odin check heimdall -collection:skadi=deps/skadi/skadi -collection:actor=deps/sleipnir/actor -no-entry-point -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall
           odin check heimdall/codegen -no-entry-point -vet -strict-style -vet-tabs -vet-packages:heimdall_codegen
 
       - name: Run 4-layer ATDD specification suite (with memory leak detection)
         run: |
-          odin test tests -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_tests,heimdall,heimdall_codegen
+          odin test tests -collection:skadi=deps/skadi/skadi -collection:actor=deps/sleipnir/actor -vet -strict-style -vet-tabs -custom-attribute:telemetry_schema -vet-packages:heimdall_tests,heimdall,heimdall_codegen
 
       - name: Verify package documentation generation
         run: |
-          odin doc heimdall -custom-attribute:telemetry_schema > /dev/null
+          odin doc heimdall -collection:skadi=deps/skadi/skadi -collection:actor=deps/sleipnir/actor -custom-attribute:telemetry_schema > /dev/null
 
       - name: Type-check benchmark suite
         run: |
